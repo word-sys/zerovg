@@ -1,0 +1,51 @@
+# Rust / Cargo
+/target/
+Cargo.lock
+**/*.rs.bk
+*.profraw
+*.profdata
+
+# C / C++ FFI build artifacts
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.pdb
+*.exe
+bindings/c/build/
+
+# Python bindings & wheels
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.whl
+.pytest_cache/
+.venv/
+venv/
+bindings/python/build/
+bindings/python/dist/
+
+# WebAssembly & JS/TS build outputs
+node_modules/
+bindings/wasm/dist/
+bindings/wasm/pkg/
+*.wasm
+
+# Fuzzing & temporary visual test outputs
+tests/fuzz/artifacts/
+tests/fuzz/corpus/
+tests/visual/out/
+
+# OS & Editor files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+IDEA.md
+PLAN.md
