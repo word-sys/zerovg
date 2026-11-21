@@ -1,0 +1,57 @@
+[package]
+name = "zerovg"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "GPL-3.0"
+description = "Zero-dependency 2D vector graphics and typography engine written in pure Rust with a C ABI"
+repository = "https://github.com/word-sys/zerovg"
+keywords = ["2d", "vector", "graphics", "typography", "no-std"]
+categories = ["graphics", "rendering", "no-std"]
+
+[lib]
+name = "zerovg"
+path = "src/lib.rs"
+
+[features]
+default = [
+    "std",
+    "threads",
+    "simd",
+    "boolean",
+    "filters",
+    "font",
+    "codec-png",
+    "codec-svg",
+    "export-vector",
+]
+std = []
+threads = ["std"]
+simd = []
+boolean = []
+filters = []
+font = []
+codec-png = []
+codec-jpeg = []
+codec-svg = ["filters"]
+export-vector = []
+ffi = []
+
+[dependencies]
+
+[build-dependencies]
+
+[dev-dependencies]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+[profile.release-size]
+inherits = "release"
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
