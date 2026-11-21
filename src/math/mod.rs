@@ -3,6 +3,7 @@
 pub mod affine;
 pub mod arena;
 pub mod color;
+pub mod dither;
 pub mod fixed;
 pub mod float;
 
@@ -12,4 +13,5 @@ pub use arena::{
     TileSegmentChunk,
 };
 pub use color::{Color, ColorSpace, LinearRgba16, LinearRgbaF32, Oklab, Oklch};
+pub use dither::DitherMode;
 pub use fixed::Fixed24_8;
