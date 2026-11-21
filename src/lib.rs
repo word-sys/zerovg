@@ -8,6 +8,7 @@ extern crate alloc;
 extern crate std;
 
 pub mod error;
+pub mod math;
 
 pub use error::{Result, ZvgError};
 
