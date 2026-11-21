@@ -1,39 +1,8 @@
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+mod common;
 
 use zerovg::math::{EdgeSeg, FrameArena, NO_CHUNK, Point, TileCmd, TileCmdKind, TileSeg};
 
-struct CountingAlloc;
-
-static COUNTING: AtomicBool = AtomicBool::new(false);
-static ALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
-static DEALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
-
-#[global_allocator]
-static GLOBAL: CountingAlloc = CountingAlloc;
-
-unsafe impl GlobalAlloc for CountingAlloc {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if COUNTING.load(Ordering::Relaxed) {
-            ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
-        }
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        if COUNTING.load(Ordering::Relaxed) {
-            DEALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
-        }
-        unsafe { System.dealloc(ptr, layout) }
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        if COUNTING.load(Ordering::Relaxed) {
-            ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
-        }
-        unsafe { System.realloc(ptr, layout, new_size) }
-    }
-}
+install_counting_alloc!();
 
 fn simulate_frame(arena: &mut FrameArena) {
     arena.reset();
@@ -76,20 +45,13 @@ fn simulate_frame(arena: &mut FrameArena) {
 fn frame_arena_zero_steady_state_allocations() {
     let mut arena = FrameArena::new();
 
-    // Warm-up frames
     for _ in 0..2 {
         simulate_frame(&mut arena);
     }
 
-    ALLOC_COUNT.store(0, Ordering::SeqCst);
-    DEALLOC_COUNT.store(0, Ordering::SeqCst);
-    COUNTING.store(true, Ordering::SeqCst);
-
-    for _ in 0..100 {
-        simulate_frame(&mut arena);
-    }
-
-    COUNTING.store(false, Ordering::SeqCst);
-    assert_eq!(ALLOC_COUNT.load(Ordering::SeqCst), 0);
-    assert_eq!(DEALLOC_COUNT.load(Ordering::SeqCst), 0);
+    assert_zero_allocs(|| {
+        for _ in 0..100 {
+            simulate_frame(&mut arena);
+        }
+    });
 }
