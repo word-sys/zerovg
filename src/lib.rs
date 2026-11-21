@@ -11,6 +11,7 @@ pub mod error;
 pub mod math;
 
 pub use error::{Result, ZvgError};
+pub use math::{Affine2D, IRect, Point, Rect, Vec2};
 
 pub const VERSION_MAJOR: u32 = 0;
 pub const VERSION_MINOR: u32 = 1;
