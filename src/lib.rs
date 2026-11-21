@@ -9,12 +9,14 @@ extern crate std;
 
 pub mod error;
 pub mod math;
+pub mod surface;
 
 pub use error::{Result, ZvgError};
 pub use math::{
     Affine2D, Color, ColorSpace, DitherMode, IRect, LinearRgba16, LinearRgbaF32, Oklab, Oklch,
     Point, Rect, Vec2,
 };
+pub use surface::{PixelFormat, Surface, SurfaceMut, SurfaceRef};
 
 pub const VERSION_MAJOR: u32 = 0;
 pub const VERSION_MINOR: u32 = 1;
