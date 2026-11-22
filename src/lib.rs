@@ -9,10 +9,12 @@ extern crate std;
 
 pub mod codec;
 pub mod error;
+pub mod geom;
 pub mod math;
 pub mod surface;
 
 pub use error::{Result, ZvgError};
+pub use geom::{FillRule, Path, PathBuilder, PathEvent, PathVerb};
 pub use math::{
     Affine2D, Color, ColorSpace, DitherMode, IRect, LinearRgba16, LinearRgbaF32, Oklab, Oklch,
     Point, Rect, Vec2,
