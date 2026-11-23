@@ -202,11 +202,15 @@ fn push_edge_fixed(
 ) {
     let fy0 = Fixed24_8::from_f64_clamped(y0).raw().clamp(0, h_fixed);
     let fy1 = Fixed24_8::from_f64_clamped(y1).raw().clamp(0, h_fixed);
-    if fy0 == fy1 {
-        return;
-    }
     let fx0 = Fixed24_8::from_f64_clamped(x0).raw().clamp(0, w_fixed);
     let fx1 = Fixed24_8::from_f64_clamped(x1).raw().clamp(0, w_fixed);
+    if fy0 == fy1 {
+        // Keep horizontal segments strictly inside a tile row that cross a 32px tile wall
+        // so Stokes' left-edge backdrop propagation stays exact across horizontal edges.
+        if (fy0 & 8191) == 0 || (fx0 >> 13) == (fx1 >> 13) {
+            return;
+        }
+    }
     edges.push(EdgeSeg {
         x0: fx0,
         y0: fy0,
@@ -231,32 +235,28 @@ fn clip_and_emit_segment(
     if !x0.is_finite() || !y0.is_finite() || !x1.is_finite() || !y1.is_finite() {
         return;
     }
-    if y0 == y1 {
-        return;
-    }
     if (y0 <= 0.0 && y1 <= 0.0) || (y0 >= h && y1 >= h) {
         return;
     }
 
     // 1. Vertical clip to [0, h]
-    let dy = y1 - y0;
-    let dx = x1 - x0;
-    if y0 < 0.0 {
-        x0 += dx * ((0.0 - y0) / dy);
-        y0 = 0.0;
-    } else if y0 > h {
-        x0 += dx * ((h - y0) / dy);
-        y0 = h;
-    }
-    if y1 < 0.0 {
-        x1 += dx * ((0.0 - y1) / dy);
-        y1 = 0.0;
-    } else if y1 > h {
-        x1 += dx * ((h - y1) / dy);
-        y1 = h;
-    }
-    if y0 == y1 {
-        return;
+    if y0 != y1 {
+        let dy = y1 - y0;
+        let dx = x1 - x0;
+        if y0 < 0.0 {
+            x0 += dx * ((0.0 - y0) / dy);
+            y0 = 0.0;
+        } else if y0 > h {
+            x0 += dx * ((h - y0) / dy);
+            y0 = h;
+        }
+        if y1 < 0.0 {
+            x1 += dx * ((0.0 - y1) / dy);
+            y1 = 0.0;
+        } else if y1 > h {
+            x1 += dx * ((h - y1) / dy);
+            y1 = h;
+        }
     }
 
     // 2. Horizontal clip against [0, w] with exact x < 0 projection to x = 0
@@ -264,7 +264,9 @@ fn clip_and_emit_segment(
         return;
     }
     if x0 <= 0.0 && x1 <= 0.0 {
-        push_edge_fixed(edges, 0.0, y0, 0.0, y1, w_fixed, h_fixed);
+        if y0 != y1 {
+            push_edge_fixed(edges, 0.0, y0, 0.0, y1, w_fixed, h_fixed);
+        }
         return;
     }
 
@@ -272,13 +274,17 @@ fn clip_and_emit_segment(
     if x0 < 0.0 {
         let t = (0.0 - x0) / (x1 - x0);
         let y_mid = (y0 + (y1 - y0) * t).clamp(0.0, h);
-        push_edge_fixed(edges, 0.0, y0, 0.0, y_mid, w_fixed, h_fixed);
+        if y0 != y_mid {
+            push_edge_fixed(edges, 0.0, y0, 0.0, y_mid, w_fixed, h_fixed);
+        }
         x0 = 0.0;
         y0 = y_mid;
     } else if x1 < 0.0 {
         let t = (0.0 - x0) / (x1 - x0);
         let y_mid = (y0 + (y1 - y0) * t).clamp(0.0, h);
-        push_edge_fixed(edges, 0.0, y_mid, 0.0, y1, w_fixed, h_fixed);
+        if y_mid != y1 {
+            push_edge_fixed(edges, 0.0, y_mid, 0.0, y1, w_fixed, h_fixed);
+        }
         x1 = 0.0;
         y1 = y_mid;
     }
@@ -497,9 +503,9 @@ mod tests {
         let mut arena = FrameArena::new();
         let range = flatten_path_for_fill(&path, Affine2D::IDENTITY, 100, 100, DEFAULT_TOLERANCE, &mut arena);
         let edges = &arena.edges[range];
-        assert_eq!(edges.len(), 2);
+        // 2 vertical edges (x=0, x=50) + 2 tile-wall-crossing horizontal edges (y=10, y=90)
+        assert_eq!(edges.len(), 4);
 
-        // One edge at x = 50 going down (+80 px), one projected edge at x = 0 going up (-80 px)
         let mut sum_dy = 0i64;
         let mut saw_left_edge = false;
         let mut saw_right_edge = false;
@@ -507,11 +513,11 @@ mod tests {
             assert!(e.x0 >= 0 && e.x1 >= 0 && e.x0 <= 100 * 256 && e.x1 <= 100 * 256);
             assert!(e.y0 >= 0 && e.y1 >= 0 && e.y0 <= 100 * 256 && e.y1 <= 100 * 256);
             sum_dy += (e.y1 - e.y0) as i64;
-            if e.x0 == 0 && e.x1 == 0 {
+            if e.x0 == 0 && e.x1 == 0 && e.y0 != e.y1 {
                 saw_left_edge = true;
                 assert_eq!(e.y1 - e.y0, -80 * 256);
             }
-            if e.x0 == 50 * 256 && e.x1 == 50 * 256 {
+            if e.x0 == 50 * 256 && e.x1 == 50 * 256 && e.y0 != e.y1 {
                 saw_right_edge = true;
                 assert_eq!(e.y1 - e.y0, 80 * 256);
             }

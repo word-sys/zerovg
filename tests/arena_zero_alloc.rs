@@ -1,6 +1,11 @@
 mod common;
 
-use zerovg::math::{EdgeSeg, FrameArena, NO_CHUNK, Point, TileCmd, TileCmdKind, TileSeg};
+use zerovg::geom::flatten::{DEFAULT_TOLERANCE, flatten_path_for_fill};
+use zerovg::geom::{FillRule, PathBuilder};
+use zerovg::math::{
+    Affine2D, EdgeSeg, FrameArena, NO_CHUNK, Point, Rect, TileCmd, TileCmdKind, TileSeg,
+};
+use zerovg::tile::TileBinner;
 
 install_counting_alloc!();
 
@@ -52,6 +57,34 @@ fn frame_arena_zero_steady_state_allocations() {
     assert_zero_allocs(|| {
         for _ in 0..100 {
             simulate_frame(&mut arena);
+        }
+    });
+}
+
+#[test]
+fn flatten_and_tile_binner_zero_steady_state_allocations() {
+    let mut pb = PathBuilder::new();
+    pb.push_circle(96.0, 64.0, 58.0);
+    pb.push_rounded_rect(Rect::new(12.5, 10.25, 180.75, 110.5), 16.0, 12.0);
+    let path = pb.finish();
+
+    let mut arena = FrameArena::new();
+    let mut binner = TileBinner::new();
+
+    for _ in 0..2 {
+        arena.reset();
+        binner.reset(256, 160);
+        let range = flatten_path_for_fill(&path, Affine2D::IDENTITY, 256, 160, DEFAULT_TOLERANCE, &mut arena);
+        binner.bin_path(range, FillRule::NonZero, 0, 0, &mut arena);
+    }
+
+    assert_zero_allocs(|| {
+        for _ in 0..100 {
+            arena.reset();
+            binner.reset(256, 160);
+            let range =
+                flatten_path_for_fill(&path, Affine2D::IDENTITY, 256, 160, DEFAULT_TOLERANCE, &mut arena);
+            binner.bin_path(range, FillRule::NonZero, 0, 0, &mut arena);
         }
     });
 }

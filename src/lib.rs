@@ -12,6 +12,7 @@ pub mod error;
 pub mod geom;
 pub mod math;
 pub mod surface;
+pub mod tile;
 
 pub use error::{Result, ZvgError};
 pub use geom::{FillRule, Path, PathBuilder, PathEvent, PathVerb};
