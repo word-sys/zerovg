@@ -3,6 +3,7 @@
 pub mod bounds;
 pub mod flatten;
 pub mod path;
+pub mod query;
 
 pub use bounds::{
     cubic_bounds, path_tight_bounds, path_transformed_tight_bounds, path_visible_in_viewport,
@@ -13,3 +14,7 @@ pub use flatten::{
     wang_cubic_subdivs, wang_quad_subdivs,
 };
 pub use path::{FillRule, Path, PathBuilder, PathEvent, PathIter, PathVerb};
+pub use query::{
+    ClosestPointResult, closest_point_on_path, point_in_fill, signed_distance_to_path,
+    winding_number,
+};
