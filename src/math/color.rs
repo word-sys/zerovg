@@ -270,6 +270,25 @@ impl Color {
     }
 
     #[inline]
+    pub fn from_linear_rgba(r: f32, g: f32, b: f32, a: f32) -> Self {
+        Self {
+            r: linear_to_srgb_f32(r),
+            g: linear_to_srgb_f32(g),
+            b: linear_to_srgb_f32(b),
+            a,
+        }
+    }
+
+    #[inline]
+    pub fn from_display_p3(r: f32, g: f32, b: f32, a: f32) -> Self {
+        let lr = srgb_to_linear_f32(r);
+        let lg = srgb_to_linear_f32(g);
+        let lb = srgb_to_linear_f32(b);
+        let (sr, sg, sb) = linear_display_p3_to_srgb(lr, lg, lb);
+        Self::from_linear_rgba(sr, sg, sb, a)
+    }
+
+    #[inline]
     pub fn to_linear_f32(self) -> LinearRgbaF32 {
         let a = clamp_finite_f32(self.a, 0.0, 1.0);
         let lr = srgb_to_linear_f32(clamp_finite_f32(self.r, -8.0, 8.0));
