@@ -3,8 +3,9 @@ mod common;
 use zerovg::geom::flatten::{DEFAULT_TOLERANCE, flatten_path_for_fill};
 use zerovg::geom::{FillRule, PathBuilder};
 use zerovg::math::{
-    Affine2D, EdgeSeg, FrameArena, NO_CHUNK, Point, Rect, TileCmd, TileCmdKind, TileSeg,
+    Affine2D, EdgeSeg, FrameArena, NO_CHUNK, Point, Rect, TILE_SIZE, TileCmd, TileCmdKind, TileSeg,
 };
+use zerovg::raster::{CoverageSpan, TileFillParams, TileRasterScratch};
 use zerovg::tile::TileBinner;
 
 install_counting_alloc!();
@@ -70,21 +71,40 @@ fn flatten_and_tile_binner_zero_steady_state_allocations() {
 
     let mut arena = FrameArena::new();
     let mut binner = TileBinner::new();
+    let mut scratch = TileRasterScratch::new();
+    let mut checksum = 0u64;
 
-    for _ in 0..2 {
+    let mut run_frame = |arena: &mut FrameArena, binner: &mut TileBinner| {
         arena.reset();
         binner.reset(256, 160);
-        let range = flatten_path_for_fill(&path, Affine2D::IDENTITY, 256, 160, DEFAULT_TOLERANCE, &mut arena);
-        binner.bin_path(range, FillRule::NonZero, 0, 0, &mut arena);
+        let range =
+            flatten_path_for_fill(&path, Affine2D::IDENTITY, 256, 160, DEFAULT_TOLERANCE, arena);
+        binner.bin_path(range, FillRule::NonZero, 0, 0, arena);
+        for tid in 0..binner.tile_count() {
+            for cmd in binner.tile_cmds(tid, arena) {
+                if cmd.kind == TileCmdKind::PathFill {
+                    let params = TileFillParams::from_cmd(cmd, TILE_SIZE, TILE_SIZE);
+                    scratch.rasterize_tile_spans(params, arena, |span| match span {
+                        CoverageSpan::Solid { x0, x1, .. } => {
+                            checksum = checksum.wrapping_add((x1 - x0) as u64);
+                        }
+                        CoverageSpan::Fractional { cov, .. } => {
+                            checksum = checksum.wrapping_add(cov.len() as u64);
+                        }
+                    });
+                }
+            }
+        }
+    };
+
+    for _ in 0..2 {
+        run_frame(&mut arena, &mut binner);
     }
 
     assert_zero_allocs(|| {
         for _ in 0..100 {
-            arena.reset();
-            binner.reset(256, 160);
-            let range =
-                flatten_path_for_fill(&path, Affine2D::IDENTITY, 256, 160, DEFAULT_TOLERANCE, &mut arena);
-            binner.bin_path(range, FillRule::NonZero, 0, 0, &mut arena);
+            run_frame(&mut arena, &mut binner);
         }
     });
+    assert!(checksum > 0);
 }

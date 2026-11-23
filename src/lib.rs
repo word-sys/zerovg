@@ -11,6 +11,7 @@ pub mod codec;
 pub mod error;
 pub mod geom;
 pub mod math;
+pub mod raster;
 pub mod surface;
 pub mod tile;
 
@@ -20,6 +21,7 @@ pub use math::{
     Affine2D, Color, ColorSpace, DitherMode, IRect, LinearRgba16, LinearRgbaF32, Oklab, Oklch,
     Point, Rect, Vec2,
 };
+pub use raster::AntialiasMode;
 pub use surface::{PixelFormat, Surface, SurfaceMut, SurfaceRef};
 
 pub const VERSION_MAJOR: u32 = 0;
