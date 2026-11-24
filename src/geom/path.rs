@@ -82,6 +82,31 @@ impl Path {
         }
     }
 
+    pub fn clear(&mut self) {
+        self.verbs.clear();
+        self.points.clear();
+        self.control_bounds = Rect::EMPTY;
+        self.has_curves = false;
+        self.axis_aligned_rect = None;
+    }
+
+    pub(crate) fn update_from_slices(&mut self, verbs: &[PathVerb], points: &[Point]) {
+        self.verbs.clear();
+        self.verbs.extend_from_slice(verbs);
+        self.points.clear();
+        self.points.extend_from_slice(points);
+        let mut control_bounds = Rect::EMPTY;
+        for &p in &self.points {
+            control_bounds = control_bounds.union_point(p);
+        }
+        self.control_bounds = control_bounds;
+        self.has_curves = self
+            .verbs
+            .iter()
+            .any(|v| matches!(v, PathVerb::QuadTo | PathVerb::CubicTo));
+        self.axis_aligned_rect = detect_axis_aligned_rect(&self.verbs, &self.points);
+    }
+
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.verbs.is_empty()
@@ -278,6 +303,65 @@ impl PathBuilder {
         self.current = None;
         self.subpath_start = None;
         self.invalid = false;
+    }
+
+    #[inline]
+    pub fn new_sub_path(&mut self) -> &mut Self {
+        self.current = None;
+        self.subpath_start = None;
+        self
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.verbs.is_empty()
+    }
+
+    pub(crate) fn transform_in_place(&mut self, m: Affine2D) {
+        if !m.is_finite() {
+            self.invalid = true;
+            return;
+        }
+        if m.is_identity() {
+            return;
+        }
+        for p in &mut self.points {
+            *p = m.transform_point(*p);
+            if !p.is_finite() {
+                self.invalid = true;
+            }
+        }
+        if let Some(c) = self.current {
+            let tc = m.transform_point(c);
+            if tc.is_finite() {
+                self.current = Some(tc);
+            } else {
+                self.invalid = true;
+            }
+        }
+        if let Some(s) = self.subpath_start {
+            let ts = m.transform_point(s);
+            if ts.is_finite() {
+                self.subpath_start = Some(ts);
+            } else {
+                self.invalid = true;
+            }
+        }
+    }
+
+    pub fn clone_into_path(&self, out: &mut Path) -> Result<()> {
+        if self.invalid {
+            out.clear();
+            return Err(ZvgError::InvalidArgument("path contains non-finite coordinates"));
+        }
+        out.update_from_slices(&self.verbs, &self.points);
+        Ok(())
+    }
+
+    pub fn finish_into(&mut self, out: &mut Path) -> Result<()> {
+        self.clone_into_path(out)?;
+        self.clear();
+        Ok(())
     }
 
     #[inline]

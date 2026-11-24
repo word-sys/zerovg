@@ -10,6 +10,8 @@ use zerovg::tile::TileBinner;
 
 install_counting_alloc!();
 
+static SERIAL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn simulate_frame(arena: &mut FrameArena) {
     arena.reset();
     for i in 0..512i32 {
@@ -49,6 +51,7 @@ fn simulate_frame(arena: &mut FrameArena) {
 
 #[test]
 fn frame_arena_zero_steady_state_allocations() {
+    let _guard = SERIAL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut arena = FrameArena::new();
 
     for _ in 0..2 {
@@ -64,6 +67,7 @@ fn frame_arena_zero_steady_state_allocations() {
 
 #[test]
 fn flatten_and_tile_binner_zero_steady_state_allocations() {
+    let _guard = SERIAL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut pb = PathBuilder::new();
     pb.push_circle(96.0, 64.0, 58.0);
     pb.push_rounded_rect(Rect::new(12.5, 10.25, 180.75, 110.5), 16.0, 12.0);

@@ -5,6 +5,8 @@ edition = "2024"
 rust-version = "1.85"
 license = "GPL-3.0"
 description = "Zero-dependency 2D vector graphics and typography engine written in pure Rust with a C ABI"
+readme = "README.md"
+homepage = "https://github.com/word-sys/zerovg"
 repository = "https://github.com/word-sys/zerovg"
 keywords = ["2d", "vector", "graphics", "typography", "no-std"]
 categories = ["graphics", "rendering", "no-std"]
@@ -12,6 +14,10 @@ categories = ["graphics", "rendering", "no-std"]
 [lib]
 name = "zerovg"
 path = "src/lib.rs"
+
+[[test]]
+name = "core_raster"
+path = "tests/visual/core_raster.rs"
 
 [features]
 default = [

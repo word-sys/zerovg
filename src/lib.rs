@@ -12,6 +12,7 @@ pub mod error;
 pub mod geom;
 pub mod math;
 pub mod raster;
+pub mod scene;
 pub mod surface;
 pub mod tile;
 
@@ -22,6 +23,7 @@ pub use math::{
     Point, Rect, Vec2,
 };
 pub use raster::AntialiasMode;
+pub use scene::{Context, StrokeStyle};
 pub use surface::{PixelFormat, Surface, SurfaceMut, SurfaceRef};
 
 pub const VERSION_MAJOR: u32 = 0;
