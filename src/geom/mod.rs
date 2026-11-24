@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod bounds;
+pub mod dash;
 pub mod flatten;
 pub mod path;
 pub mod query;
@@ -9,6 +10,10 @@ pub mod stroke;
 pub use bounds::{
     cubic_bounds, path_tight_bounds, path_transformed_tight_bounds, path_visible_in_viewport,
     quad_bounds,
+};
+pub use dash::{
+    cubic_arc_length, cubic_t_at_arc_length, dash_path, dash_path_into, quad_arc_length,
+    quad_t_at_arc_length, subpath_arc_lengths,
 };
 pub use flatten::{
     DEFAULT_TOLERANCE, flatten_cubic, flatten_path_for_fill, flatten_path_segments, flatten_quad,

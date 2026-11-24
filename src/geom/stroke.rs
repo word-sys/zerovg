@@ -3,6 +3,7 @@
 use alloc::vec::Vec;
 
 use crate::geom::bounds::{cubic_bounds, quad_bounds};
+use crate::geom::dash::dash_path_into;
 use crate::geom::path::{Path, PathBuilder, PathEvent};
 use crate::math::affine::{Affine2D, Point, Rect, Vec2};
 use crate::math::float::{abs_f64, atan2_f32, ceil_f32, copysign_f64, sincos_f32, sqrt_f64};
@@ -1320,11 +1321,41 @@ pub fn expand_stroke_into(
         (Affine2D::IDENTITY, transform, user_tol)
     };
 
+    // Apply arc-length dashing in the active stroke coordinate space (user-space vs non-scaling screen-space)
+    let dashed_storage: Path;
+    let effective_in_xform: Affine2D;
+    let source_path: &Path = if let Some(dashes) = style.dash_array {
+        let mut dash_pb = PathBuilder::new();
+        let transformed_for_dash: Path;
+        let to_dash = if !in_xform.is_identity() {
+            match path.transform(in_xform) {
+                Ok(p) => {
+                    transformed_for_dash = p;
+                    &transformed_for_dash
+                }
+                Err(_) => return,
+            }
+        } else {
+            path
+        };
+        if dash_path_into(to_dash, dashes, style.dash_offset, &mut dash_pb) {
+            dashed_storage = dash_pb.finish();
+            effective_in_xform = Affine2D::IDENTITY;
+            &dashed_storage
+        } else {
+            effective_in_xform = in_xform;
+            path
+        }
+    } else {
+        effective_in_xform = in_xform;
+        path
+    };
+
     let map_in = |p: Point| {
-        if in_xform.is_identity() {
+        if effective_in_xform.is_identity() {
             p
         } else {
-            in_xform.transform_point(p)
+            effective_in_xform.transform_point(p)
         }
     };
     let map_out = |p: Point| {
@@ -1344,7 +1375,7 @@ pub fn expand_stroke_into(
     let mut sub_start = Point::ZERO;
     let mut in_subpath = false;
 
-    for ev in path.iter() {
+    for ev in source_path.iter() {
         match ev {
             PathEvent::MoveTo(p) => {
                 if in_subpath {

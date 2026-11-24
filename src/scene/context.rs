@@ -35,6 +35,9 @@ struct ContextState {
     line_join: LineJoin,
     miter_limit: f32,
     non_scaling_stroke: bool,
+    dash_start: usize,
+    dash_len: usize,
+    dash_offset: f32,
 }
 
 impl Default for ContextState {
@@ -51,6 +54,9 @@ impl Default for ContextState {
             line_join: LineJoin::Miter,
             miter_limit: 4.0,
             non_scaling_stroke: false,
+            dash_start: 0,
+            dash_len: 0,
+            dash_offset: 0.0,
         }
     }
 }
@@ -59,6 +65,7 @@ pub struct Context<'a> {
     surface: SurfaceMut<'a>,
     state: ContextState,
     state_stack: Vec<ContextState>,
+    dash_storage: Vec<f32>,
     current_path: PathBuilder,
     scratch_path: Path,
     stroke_builder: PathBuilder,
@@ -88,6 +95,7 @@ impl<'a> Context<'a> {
             surface,
             state: ContextState::default(),
             state_stack: Vec::new(),
+            dash_storage: Vec::new(),
             current_path: PathBuilder::new(),
             scratch_path: Path::empty(),
             stroke_builder: PathBuilder::new(),
@@ -123,6 +131,8 @@ impl<'a> Context<'a> {
         if let Some(prev) = self.state_stack.pop() {
             let old_ctm = self.state.transform;
             self.state = prev;
+            self.dash_storage
+                .truncate(self.state.dash_start + self.state.dash_len);
             self.adapt_current_path_ctm(old_ctm, self.state.transform);
             true
         } else {
@@ -299,23 +309,52 @@ impl<'a> Context<'a> {
     }
 
     #[inline]
+    pub fn set_dash(&mut self, dashes: &[f32], offset: f32) {
+        if dashes.is_empty() {
+            self.clear_dash();
+            return;
+        }
+        let start = self.dash_storage.len();
+        self.dash_storage.extend_from_slice(dashes);
+        self.state.dash_start = start;
+        self.state.dash_len = dashes.len();
+        self.state.dash_offset = offset;
+    }
+
+    #[inline]
+    pub fn clear_dash(&mut self) {
+        self.state.dash_len = 0;
+        self.state.dash_offset = 0.0;
+    }
+
+    #[inline]
     pub fn set_stroke_style(&mut self, style: StrokeStyle<'_>) {
         self.set_line_width(style.width);
         self.state.line_cap = style.cap;
         self.state.line_join = style.join;
         self.set_miter_limit(style.miter_limit);
         self.state.non_scaling_stroke = style.non_scaling;
+        if let Some(dashes) = style.dash_array {
+            self.set_dash(dashes, style.dash_offset);
+        } else {
+            self.clear_dash();
+        }
     }
 
     #[inline]
-    pub fn stroke_style(&self) -> StrokeStyle<'static> {
+    pub fn stroke_style(&self) -> StrokeStyle<'_> {
+        let dash_array = if self.state.dash_len > 0 {
+            Some(&self.dash_storage[self.state.dash_start..self.state.dash_start + self.state.dash_len])
+        } else {
+            None
+        };
         StrokeStyle {
             width: self.state.line_width,
             cap: self.state.line_cap,
             join: self.state.line_join,
             miter_limit: self.state.miter_limit,
-            dash_array: None,
-            dash_offset: 0.0,
+            dash_array,
+            dash_offset: self.state.dash_offset,
             non_scaling: self.state.non_scaling_stroke,
         }
     }
@@ -481,7 +520,24 @@ impl<'a> Context<'a> {
             return;
         }
         if let Ok(path) = self.current_path.try_finish() {
-            let style = self.stroke_style();
+            let dashes_copy: Option<Vec<f32>> = if self.state.dash_len > 0 {
+                Some(
+                    self.dash_storage
+                        [self.state.dash_start..self.state.dash_start + self.state.dash_len]
+                        .to_vec(),
+                )
+            } else {
+                None
+            };
+            let style = StrokeStyle {
+                width: self.state.line_width,
+                cap: self.state.line_cap,
+                join: self.state.line_join,
+                miter_limit: self.state.miter_limit,
+                dash_array: dashes_copy.as_deref(),
+                dash_offset: self.state.dash_offset,
+                non_scaling: self.state.non_scaling_stroke,
+            };
             self.stroke(&path, &style);
         }
     }
