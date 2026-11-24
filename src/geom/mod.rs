@@ -1,11 +1,19 @@
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "boolean")]
+pub mod boolean;
 pub mod bounds;
 pub mod dash;
 pub mod flatten;
 pub mod path;
 pub mod query;
 pub mod stroke;
+
+#[cfg(feature = "boolean")]
+pub use boolean::{
+    GRID_MAX, GridPoint, GridSeg, GridTransform, HotPixel, SegmentIntersection, collect_hot_pixels,
+    intersect_segments, orient2d, orient2d_det,
+};
 
 pub use bounds::{
     cubic_bounds, path_tight_bounds, path_transformed_tight_bounds, path_visible_in_viewport,
