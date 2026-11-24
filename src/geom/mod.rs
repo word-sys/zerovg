@@ -11,8 +11,9 @@ pub mod stroke;
 
 #[cfg(feature = "boolean")]
 pub use boolean::{
-    GRID_MAX, GridPoint, GridSeg, GridTransform, HotPixel, SegmentIntersection, collect_hot_pixels,
-    intersect_segments, orient2d, orient2d_det,
+    BooleanOp, GRID_MAX, GridPoint, GridSeg, GridTransform, HotPixel, SegmentIntersection,
+    boolean_op, collect_hot_pixels, hobby_snap_round, intersect_segments, offset_path, orient2d,
+    orient2d_det, simplify_path,
 };
 
 pub use bounds::{

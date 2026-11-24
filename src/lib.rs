@@ -17,6 +17,8 @@ pub mod surface;
 pub mod tile;
 
 pub use error::{Result, ZvgError};
+#[cfg(feature = "boolean")]
+pub use geom::{BooleanOp, boolean_op, offset_path, simplify_path};
 pub use geom::{FillRule, LineCap, LineJoin, Path, PathBuilder, PathEvent, PathVerb, StrokeStyle};
 pub use math::{
     Affine2D, Color, ColorSpace, DitherMode, IRect, LinearRgba16, LinearRgbaF32, Oklab, Oklch,

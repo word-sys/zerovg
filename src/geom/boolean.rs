@@ -1,16 +1,28 @@
 #![forbid(unsafe_code)]
 
+use alloc::vec;
 use alloc::vec::Vec;
 use core::cmp::Ordering;
 
 use crate::geom::flatten::flatten_path_segments;
-use crate::geom::path::Path;
+use crate::geom::path::{FillRule, Path, PathBuilder};
+use crate::geom::stroke::{LineCap, LineJoin, StrokeStyle, expand_stroke_path};
 use crate::math::affine::{Affine2D, Point};
 use crate::math::float::{abs_f64, round_ties_even_f64};
 
 // Grid bound 2^38 guarantees all i128 cross products (<= 2^79) and rational numerators
 // (t_num * dx <= 2^118) fit strictly inside i128 with zero overflow.
 pub const GRID_MAX: i64 = 1 << 38;
+const MAX_SNAP_ITERS: usize = 16;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BooleanOp {
+    Union,
+    Intersection,
+    Difference,
+    Xor,
+    Simplify,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct GridPoint {
@@ -525,6 +537,584 @@ pub fn collect_hot_pixels(segments: &[GridSeg]) -> Vec<HotPixel> {
     hot_pixels
 }
 
+// Exact i128 test: does open segment (a, b) intersect the closed unit square [h - 0.5, h + 0.5]^2?
+#[inline]
+fn seg_hits_hot_pixel(a: GridPoint, b: GridPoint, h: HotPixel) -> bool {
+    if h == a || h == b {
+        return false;
+    }
+    let min_x = a.x.min(b.x);
+    let max_x = a.x.max(b.x);
+    let min_y = a.y.min(b.y);
+    let max_y = a.y.max(b.y);
+    if h.x < min_x || h.x > max_x || h.y < min_y || h.y > max_y {
+        return false;
+    }
+    let dx = (b.x as i128) - (a.x as i128);
+    let dy = (b.y as i128) - (a.y as i128);
+    let c = orient2d_det(a, b, h);
+    (c.unsigned_abs() << 1) <= dx.unsigned_abs() + dy.unsigned_abs()
+}
+
+// Hobby's Iterated Snap-Rounding: splits every segment passing through any hot-pixel unit square
+// and iterates until convergence (zero interior crossings remain).
+pub fn hobby_snap_round(input: &[GridSeg]) -> Vec<GridSeg> {
+    let mut segs: Vec<GridSeg> = input
+        .iter()
+        .copied()
+        .filter(|s| !s.is_degenerate())
+        .collect();
+    if segs.is_empty() {
+        return segs;
+    }
+
+    let mut hits: Vec<(i128, HotPixel)> = Vec::new();
+    let mut next_segs: Vec<GridSeg> = Vec::with_capacity(segs.len() * 2);
+
+    for _iter in 0..MAX_SNAP_ITERS {
+        let hot_pixels = collect_hot_pixels(&segs);
+        if hot_pixels.is_empty() {
+            break;
+        }
+        next_segs.clear();
+        let mut any_split = false;
+
+        for &s in &segs {
+            let min_x = s.a.x.min(s.b.x);
+            let max_x = s.a.x.max(s.b.x);
+            let lo = hot_pixels.partition_point(|hp| hp.x < min_x);
+            let hi = hot_pixels.partition_point(|hp| hp.x <= max_x);
+
+            hits.clear();
+            let dx = (s.b.x as i128) - (s.a.x as i128);
+            let dy = (s.b.y as i128) - (s.a.y as i128);
+            for &hp in &hot_pixels[lo..hi] {
+                if seg_hits_hot_pixel(s.a, s.b, hp) {
+                    let proj = ((hp.x as i128) - (s.a.x as i128)) * dx
+                        + ((hp.y as i128) - (s.a.y as i128)) * dy;
+                    hits.push((proj, hp));
+                }
+            }
+
+            if hits.is_empty() {
+                next_segs.push(s);
+            } else {
+                any_split = true;
+                hits.sort_unstable_by(|u, v| u.0.cmp(&v.0).then_with(|| u.1.cmp(&v.1)));
+                let mut prev = s.a;
+                for &(_, hp) in &hits {
+                    if hp != prev {
+                        next_segs.push(GridSeg::new(prev, hp, s.poly_id, s.dir));
+                        prev = hp;
+                    }
+                }
+                if prev != s.b {
+                    next_segs.push(GridSeg::new(prev, s.b, s.poly_id, s.dir));
+                }
+            }
+        }
+
+        core::mem::swap(&mut segs, &mut next_segs);
+        if !any_split {
+            break;
+        }
+    }
+
+    segs
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ArrEdge {
+    lo: GridPoint,
+    hi: GridPoint,
+    delta_a: i32,
+    delta_b: i32,
+    right_wa: i32,
+    right_wb: i32,
+}
+
+impl ArrEdge {
+    #[inline]
+    fn is_vertical(&self) -> bool {
+        self.lo.x == self.hi.x
+    }
+
+    #[inline]
+    fn as_sweep_seg(&self) -> SweepSeg {
+        SweepSeg {
+            lo: self.lo,
+            hi: self.hi,
+            orig: GridSeg::new(self.lo, self.hi, 0, 1),
+        }
+    }
+}
+
+#[inline]
+fn is_winding_inside(w: i32, rule: FillRule) -> bool {
+    match rule {
+        FillRule::NonZero => w != 0,
+        FillRule::EvenOdd => (w & 1) != 0,
+    }
+}
+
+#[inline]
+fn eval_boolean_op(op: BooleanOp, a: bool, b: bool) -> bool {
+    match op {
+        BooleanOp::Union => a || b,
+        BooleanOp::Intersection => a && b,
+        BooleanOp::Difference => a && !b,
+        BooleanOp::Xor => a ^ b,
+        BooleanOp::Simplify => a,
+    }
+}
+
+fn build_arrangement(snapped: &[GridSeg]) -> Vec<ArrEdge> {
+    if snapped.is_empty() {
+        return Vec::new();
+    }
+    let mut raw: Vec<(GridPoint, GridPoint, i32, i32)> = Vec::with_capacity(snapped.len());
+    for &s in snapped {
+        if s.is_degenerate() {
+            continue;
+        }
+        let (lo, hi, flipped) = s.ordered_endpoints();
+        let signed = if flipped { -(s.dir as i32) } else { s.dir as i32 };
+        let (da, db) = if s.poly_id == 0 {
+            (signed, 0)
+        } else {
+            (0, signed)
+        };
+        raw.push((lo, hi, da, db));
+    }
+
+    raw.sort_unstable_by(|u, v| u.0.cmp(&v.0).then_with(|| u.1.cmp(&v.1)));
+
+    let mut edges: Vec<ArrEdge> = Vec::with_capacity(raw.len());
+    for (lo, hi, da, db) in raw {
+        if let Some(last) = edges.last_mut()
+            && last.lo == lo
+            && last.hi == hi
+        {
+            last.delta_a = last.delta_a.wrapping_add(da);
+            last.delta_b = last.delta_b.wrapping_add(db);
+            continue;
+        }
+        edges.push(ArrEdge {
+            lo,
+            hi,
+            delta_a: da,
+            delta_b: db,
+            right_wa: 0,
+            right_wb: 0,
+        });
+    }
+
+    edges.retain(|e| e.delta_a != 0 || e.delta_b != 0);
+    assign_arrangement_windings(&mut edges);
+    edges
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindEventKind {
+    Remove = 0,
+    Insert = 1,
+    Vertical = 2,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WindEvent {
+    x: i64,
+    kind: WindEventKind,
+    edge_idx: usize,
+}
+
+fn assign_arrangement_windings(edges: &mut [ArrEdge]) {
+    let mut events: Vec<WindEvent> = Vec::with_capacity(edges.len() * 2);
+    for (i, e) in edges.iter().enumerate() {
+        if e.is_vertical() {
+            events.push(WindEvent {
+                x: e.lo.x,
+                kind: WindEventKind::Vertical,
+                edge_idx: i,
+            });
+        } else {
+            events.push(WindEvent {
+                x: e.lo.x,
+                kind: WindEventKind::Insert,
+                edge_idx: i,
+            });
+            events.push(WindEvent {
+                x: e.hi.x,
+                kind: WindEventKind::Remove,
+                edge_idx: i,
+            });
+        }
+    }
+
+    events.sort_unstable_by(|a, b| {
+        a.x.cmp(&b.x)
+            .then_with(|| (a.kind as u8).cmp(&(b.kind as u8)))
+            .then_with(|| {
+                if a.kind == WindEventKind::Insert && b.kind == WindEventKind::Insert {
+                    cmp_segs_at_x(
+                        &edges[a.edge_idx].as_sweep_seg(),
+                        &edges[b.edge_idx].as_sweep_seg(),
+                        a.x,
+                    )
+                } else {
+                    a.edge_idx.cmp(&b.edge_idx)
+                }
+            })
+    });
+
+    let mut active: Vec<usize> = Vec::new();
+    let mut ev_i = 0usize;
+
+    while ev_i < events.len() {
+        let x = events[ev_i].x;
+
+        // 1. Remove edges ending at x
+        while ev_i < events.len()
+            && events[ev_i].x == x
+            && events[ev_i].kind == WindEventKind::Remove
+        {
+            let idx = events[ev_i].edge_idx;
+            if let Some(pos) = active.iter().position(|&id| id == idx) {
+                active.remove(pos);
+            }
+            ev_i += 1;
+        }
+
+        // Re-verify vertical ordering at x in case snap-rounding converged with tiny residual touch
+        active.sort_unstable_by(|&a, &b| {
+            cmp_segs_at_x(&edges[a].as_sweep_seg(), &edges[b].as_sweep_seg(), x)
+        });
+
+        // 2. Insert non-vertical edges starting at x (already sorted by (y(x), slope) ascending)
+        while ev_i < events.len()
+            && events[ev_i].x == x
+            && events[ev_i].kind == WindEventKind::Insert
+        {
+            let idx = events[ev_i].edge_idx;
+            let seg = edges[idx].as_sweep_seg();
+            let pos = active.partition_point(|&a_idx| {
+                cmp_segs_at_x(&edges[a_idx].as_sweep_seg(), &seg, x) == Ordering::Less
+            });
+            if pos > 0 {
+                let below = edges[active[pos - 1]];
+                edges[idx].right_wa = below.right_wa.wrapping_add(below.delta_a);
+                edges[idx].right_wb = below.right_wb.wrapping_add(below.delta_b);
+            }
+            active.insert(pos, idx);
+            ev_i += 1;
+        }
+
+        // 3. Assign right (+x) winding to vertical edges at x
+        while ev_i < events.len()
+            && events[ev_i].x == x
+            && events[ev_i].kind == WindEventKind::Vertical
+        {
+            let idx = events[ev_i].edge_idx;
+            let lo_y = edges[idx].lo.y;
+            let pos = active.partition_point(|&a_idx| {
+                cmp_seg_y_to_point(&edges[a_idx].as_sweep_seg(), x, lo_y) != Ordering::Greater
+            });
+            if pos > 0 {
+                let below = edges[active[pos - 1]];
+                edges[idx].right_wa = below.right_wa.wrapping_add(below.delta_a);
+                edges[idx].right_wb = below.right_wb.wrapping_add(below.delta_b);
+            }
+            ev_i += 1;
+        }
+    }
+}
+
+#[inline]
+fn angle_quadrant(dx: i128, dy: i128) -> u8 {
+    if dy >= 0 && dx > 0 {
+        0
+    } else if dx <= 0 && dy > 0 {
+        1
+    } else if dy <= 0 && dx < 0 {
+        2
+    } else {
+        3
+    }
+}
+
+// Exact CCW polar angle comparator in i128 (zero trig).
+#[inline]
+fn cmp_dir_ccw(a: (i128, i128), b: (i128, i128)) -> Ordering {
+    let qa = angle_quadrant(a.0, a.1);
+    let qb = angle_quadrant(b.0, b.1);
+    match qa.cmp(&qb) {
+        Ordering::Equal => (b.0 * a.1).cmp(&(a.0 * b.1)),
+        ord => ord,
+    }
+}
+
+fn extract_contours(
+    half_edges: &[(GridPoint, GridPoint)],
+    xf: &GridTransform,
+) -> Path {
+    if half_edges.is_empty() {
+        return Path::empty();
+    }
+
+    // Collect unique vertices and index outgoing half-edges per vertex
+    let mut verts: Vec<GridPoint> = Vec::with_capacity(half_edges.len() * 2);
+    for &(u, v) in half_edges {
+        verts.push(u);
+        verts.push(v);
+    }
+    verts.sort_unstable();
+    verts.dedup();
+
+    let mut outgoing: Vec<Vec<(usize, usize)>> = vec![Vec::new(); verts.len()];
+    let mut edge_to: Vec<usize> = Vec::with_capacity(half_edges.len());
+    let mut edge_dir: Vec<(i128, i128)> = Vec::with_capacity(half_edges.len());
+
+    for (eid, &(u, v)) in half_edges.iter().enumerate() {
+        let ui = verts.binary_search(&u).unwrap();
+        let vi = verts.binary_search(&v).unwrap();
+        outgoing[ui].push((eid, vi));
+        edge_to.push(vi);
+        edge_dir.push(((v.x as i128) - (u.x as i128), (v.y as i128) - (u.y as i128)));
+    }
+
+    // Sort outgoing half-edges at each vertex by CCW polar angle
+    for list in &mut outgoing {
+        list.sort_unstable_by(|&(ea, _), &(eb, _)| cmp_dir_ccw(edge_dir[ea], edge_dir[eb]));
+    }
+
+    let mut used = vec![false; half_edges.len()];
+    let mut pb = PathBuilder::new();
+    let mut loop_pts: Vec<GridPoint> = Vec::new();
+    let mut simplified: Vec<GridPoint> = Vec::new();
+
+    for start_eid in 0..half_edges.len() {
+        if used[start_eid] {
+            continue;
+        }
+        loop_pts.clear();
+        let start_u = half_edges[start_eid].0;
+        let mut cur_eid = start_eid;
+
+        // Defensive cap prevents infinite loops on malformed degenerate graphs
+        for _step in 0..=half_edges.len() {
+            if used[cur_eid] {
+                break;
+            }
+            used[cur_eid] = true;
+            let (u, v) = half_edges[cur_eid];
+            loop_pts.push(u);
+            if v == start_u {
+                break;
+            }
+
+            let vi = edge_to[cur_eid];
+            let rev_dir = ((u.x as i128) - (v.x as i128), (u.y as i128) - (v.y as i128));
+            let list = &outgoing[vi];
+            if list.is_empty() {
+                break;
+            }
+
+            // Pick first unused outgoing edge clockwise from rev_dir (tightest left-interior turn)
+            let pos = list.partition_point(|&(eid, _)| cmp_dir_ccw(edge_dir[eid], rev_dir) == Ordering::Less);
+            let mut chosen: Option<usize> = None;
+            let n = list.len();
+            for offset in 1..=n {
+                let idx = (pos + n - offset) % n;
+                let cand = list[idx].0;
+                if !used[cand] {
+                    chosen = Some(cand);
+                    break;
+                }
+            }
+            match chosen {
+                Some(next_eid) => cur_eid = next_eid,
+                None => break,
+            }
+        }
+
+        // Collapse collinear consecutive vertices (including wrap-around seam)
+        simplified.clear();
+        for &p in &loop_pts {
+            while simplified.len() >= 2 {
+                let a = simplified[simplified.len() - 2];
+                let b = simplified[simplified.len() - 1];
+                if orient2d_det(a, b, p) == 0 {
+                    simplified.pop();
+                } else {
+                    break;
+                }
+            }
+            if simplified.last().copied() != Some(p) {
+                simplified.push(p);
+            }
+        }
+        // Trim wrap-around collinearity
+        loop {
+            let n = simplified.len();
+            if n < 3 {
+                break;
+            }
+            if orient2d_det(simplified[n - 2], simplified[n - 1], simplified[0]) == 0 {
+                simplified.pop();
+            } else if orient2d_det(simplified[n - 1], simplified[0], simplified[1]) == 0 {
+                simplified.remove(0);
+            } else {
+                break;
+            }
+        }
+
+        if simplified.len() >= 3 {
+            let p0 = xf.from_grid(simplified[0]);
+            pb.move_to(p0.x, p0.y);
+            for &gp in &simplified[1..] {
+                let p = xf.from_grid(gp);
+                pb.line_to(p.x, p.y);
+            }
+            pb.close();
+        }
+    }
+
+    pb.finish()
+}
+
+// Executes a snap-rounded exact boolean operation on two paths.
+pub fn boolean_op(
+    subject: &Path,
+    clip: &Path,
+    op: BooleanOp,
+    subject_rule: FillRule,
+    clip_rule: FillRule,
+    tolerance: f32,
+) -> Path {
+    let tol = if tolerance.is_finite() && tolerance > 0.0 {
+        tolerance.max(1e-4)
+    } else {
+        0.25
+    };
+
+    if subject.is_empty() && clip.is_empty() {
+        return Path::empty();
+    }
+    match op {
+        BooleanOp::Intersection | BooleanOp::Difference | BooleanOp::Simplify
+            if subject.is_empty() =>
+        {
+            return Path::empty();
+        }
+        BooleanOp::Intersection if clip.is_empty() => {
+            return Path::empty();
+        }
+        _ => {}
+    }
+
+    let xf = if op == BooleanOp::Simplify {
+        GridTransform::from_paths(&[subject], tol)
+    } else {
+        GridTransform::from_paths(&[subject, clip], tol)
+    };
+
+    let mut grid_segs: Vec<GridSeg> = Vec::new();
+    xf.flatten_path_to_grid(subject, 0, tol, &mut grid_segs);
+    if op != BooleanOp::Simplify {
+        xf.flatten_path_to_grid(clip, 1, tol, &mut grid_segs);
+    }
+    if grid_segs.is_empty() {
+        return Path::empty();
+    }
+
+    let snapped = hobby_snap_round(&grid_segs);
+    let arrangement = build_arrangement(&snapped);
+
+    let mut boundary: Vec<(GridPoint, GridPoint)> = Vec::new();
+    for e in &arrangement {
+        let left_wa = e.right_wa.wrapping_add(e.delta_a);
+        let left_wb = e.right_wb.wrapping_add(e.delta_b);
+        let in_left = eval_boolean_op(
+            op,
+            is_winding_inside(left_wa, subject_rule),
+            is_winding_inside(left_wb, clip_rule),
+        );
+        let in_right = eval_boolean_op(
+            op,
+            is_winding_inside(e.right_wa, subject_rule),
+            is_winding_inside(e.right_wb, clip_rule),
+        );
+        if in_left && !in_right {
+            boundary.push((e.lo, e.hi));
+        } else if !in_left && in_right {
+            boundary.push((e.hi, e.lo));
+        }
+    }
+
+    extract_contours(&boundary, &xf)
+}
+
+#[inline]
+pub fn simplify_path(path: &Path, fill_rule: FillRule, tolerance: f32) -> Path {
+    boolean_op(
+        path,
+        &Path::empty(),
+        BooleanOp::Simplify,
+        fill_rule,
+        FillRule::NonZero,
+        tolerance,
+    )
+}
+
+// Inflates (delta > 0) or deflates (delta < 0) a closed path cleanly via the snap-rounded arrangement.
+pub fn offset_path(
+    path: &Path,
+    delta: f32,
+    join: LineJoin,
+    miter_limit: f32,
+    tolerance: f32,
+) -> Path {
+    if path.is_empty() || !delta.is_finite() {
+        return Path::empty();
+    }
+    let tol = if tolerance.is_finite() && tolerance > 0.0 {
+        tolerance.max(1e-4)
+    } else {
+        0.25
+    };
+    let base = simplify_path(path, FillRule::NonZero, tol);
+    if base.is_empty() || delta == 0.0 {
+        return base;
+    }
+
+    let width = 2.0 * (abs_f64(delta as f64) as f32);
+    let style = StrokeStyle::new(width)
+        .with_cap(LineCap::Round)
+        .with_join(join)
+        .with_miter_limit(miter_limit);
+    let band = expand_stroke_path(&base, Affine2D::IDENTITY, &style, tol);
+
+    if delta > 0.0 {
+        boolean_op(
+            &base,
+            &band,
+            BooleanOp::Union,
+            FillRule::NonZero,
+            FillRule::NonZero,
+            tol,
+        )
+    } else {
+        boolean_op(
+            &base,
+            &band,
+            BooleanOp::Difference,
+            FillRule::NonZero,
+            FillRule::NonZero,
+            tol,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -708,5 +1298,187 @@ mod tests {
             let brute = brute_force_hot_pixels(&segs);
             assert_eq!(sweep, brute);
         }
+    }
+
+    fn polygon_signed_area(path: &Path) -> f64 {
+        let mut area2 = 0.0f64;
+        flatten_path_segments(path, Affine2D::IDENTITY, 0.1, true, &mut |a, b| {
+            area2 += (a.x as f64) * (b.y as f64) - (b.x as f64) * (a.y as f64);
+        });
+        0.5 * area2
+    }
+
+    fn make_random_polygon(seed: &mut u64) -> Path {
+        let mut next_u64 = || -> u64 {
+            *seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            *seed
+        };
+        let n = 3 + (next_u64() % 6) as usize;
+        let mut pb = PathBuilder::new();
+        for i in 0..n {
+            let x = (((next_u64() >> 40) as f32) / ((1u32 << 24) as f32)) * 100.0;
+            let y = (((next_u64() >> 40) as f32) / ((1u32 << 24) as f32)) * 100.0;
+            if i == 0 {
+                pb.move_to(x, y);
+            } else {
+                pb.line_to(x, y);
+            }
+        }
+        pb.close();
+        pb.finish()
+    }
+
+    #[test]
+    fn algebraic_set_theory_laws_across_1000_randomized_polygon_pairs() {
+        let mut seed = 0xCAFE_BABE_1234_5678u64;
+        for case in 0..1000 {
+            let a = make_random_polygon(&mut seed);
+            let b = make_random_polygon(&mut seed);
+            let rule = if (case & 1) == 0 {
+                FillRule::NonZero
+            } else {
+                FillRule::EvenOdd
+            };
+
+            let sa = simplify_path(&a, rule, 0.25);
+            let sb = simplify_path(&b, rule, 0.25);
+            let area_a = polygon_signed_area(&sa);
+            let area_b = polygon_signed_area(&sb);
+            assert!(area_a >= -1e-2 && area_b >= -1e-2);
+
+            let u = boolean_op(&a, &b, BooleanOp::Union, rule, rule, 0.25);
+            let inter = boolean_op(&a, &b, BooleanOp::Intersection, rule, rule, 0.25);
+            let area_u = polygon_signed_area(&u);
+            let area_i = polygon_signed_area(&inter);
+
+            // Law 1: Area(A U B) + Area(A n B) == Area(A) + Area(B)
+            let lhs = area_u + area_i;
+            let rhs = area_a + area_b;
+            let tol = 1e-2 * (rhs.abs() + 1.0);
+            assert!(
+                abs_f64(lhs - rhs) <= tol,
+                "case {case} inclusion-exclusion failed: U={area_u} I={area_i} A={area_a} B={area_b}"
+            );
+
+            // Law 2 & 3 on every 10th pair (keeps debug test time crisp while still checking 100 full sets!)
+            if case % 10 == 0 {
+                let d_ab = boolean_op(&a, &b, BooleanOp::Difference, rule, rule, 0.25);
+                let d_ba = boolean_op(&b, &a, BooleanOp::Difference, rule, rule, 0.25);
+                let u_diff = boolean_op(
+                    &d_ab,
+                    &d_ba,
+                    BooleanOp::Union,
+                    FillRule::NonZero,
+                    FillRule::NonZero,
+                    0.25,
+                );
+                let xor = boolean_op(&a, &b, BooleanOp::Xor, rule, rule, 0.25);
+                let area_ud = polygon_signed_area(&u_diff);
+                let area_xor = polygon_signed_area(&xor);
+                assert!(
+                    abs_f64(area_ud - area_xor) <= tol,
+                    "case {case} xor law failed: (A\\B)U(B\\A)={area_ud}, xor={area_xor}"
+                );
+
+                // Law 3: Simplify(Simplify(A)) has identical area
+                let ssa = simplify_path(&sa, FillRule::NonZero, 0.25);
+                assert!(
+                    abs_f64(polygon_signed_area(&ssa) - area_a) <= tol,
+                    "case {case} simplify idempotence failed"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn offset_path_inflate_deflate_round_join_and_pinch_split() {
+        use crate::math::affine::Rect;
+
+        // 1. Inflate & deflate 40x60 rectangle by +/-10 with Miter join
+        let mut rpb = PathBuilder::new();
+        rpb.push_rect(Rect::from_xywh(100.0, 100.0, 40.0, 60.0));
+        let rect = rpb.finish();
+
+        let inflated = offset_path(&rect, 10.0, LineJoin::Miter, 4.0, 0.1);
+        assert!(
+            abs_f64(polygon_signed_area(&inflated) - (60.0 * 80.0)) < 0.5,
+            "inflated area={}",
+            polygon_signed_area(&inflated)
+        );
+
+        let deflated = offset_path(&rect, -10.0, LineJoin::Miter, 4.0, 0.1);
+        assert!(
+            abs_f64(polygon_signed_area(&deflated) - (20.0 * 40.0)) < 0.5,
+            "deflated area={}",
+            polygon_signed_area(&deflated)
+        );
+
+        // Over-deflate by -25 (> half width 20) -> completely vanishes to empty path
+        let vanished = offset_path(&rect, -25.0, LineJoin::Miter, 4.0, 0.1);
+        assert!(vanished.is_empty());
+
+        // 2. Round-join inflate area: 40*60 + 2*10*(40+60) + pi*10^2 = 2400 + 2000 + 314.159 = 4714.159
+        let rounded = offset_path(&rect, 10.0, LineJoin::Round, 4.0, 0.02);
+        let expected_round = 2400.0 + 2000.0 + core::f64::consts::PI * 100.0;
+        assert!(
+            abs_f64(polygon_signed_area(&rounded) - expected_round) < 1.5,
+            "rounded area={}, expected={expected_round}",
+            polygon_signed_area(&rounded)
+        );
+
+        // 3. Dumbbell pinch-off: two 40x40 squares connected by a 10px bridge, deflated by -7px
+        // Bridge vanishes and shape splits cleanly into two disjoint 26x26 squares (total area = 1352)
+        let mut dpb = PathBuilder::new();
+        dpb.push_rect(Rect::from_xywh(0.0, 0.0, 40.0, 40.0));
+        dpb.push_rect(Rect::from_xywh(40.0, 15.0, 20.0, 10.0));
+        dpb.push_rect(Rect::from_xywh(60.0, 0.0, 40.0, 40.0));
+        let dumbbell = dpb.finish();
+        let split = offset_path(&dumbbell, -7.0, LineJoin::Miter, 4.0, 0.1);
+        let move_count = split
+            .verbs()
+            .iter()
+            .filter(|&&v| v == crate::geom::PathVerb::MoveTo)
+            .count();
+        assert_eq!(move_count, 2, "expected dumbbell to split into 2 disjoint contours");
+        assert!(
+            abs_f64(polygon_signed_area(&split) - (2.0 * 26.0 * 26.0)) < 1.0,
+            "split area={}",
+            polygon_signed_area(&split)
+        );
+    }
+
+    #[test]
+    fn extreme_coordinate_fuzz_seeds_never_panic() {
+        // NaN, Inf, subnormals, 1e30, micro-slivers 1e-7 -> must never panic
+        let mut p_nan = PathBuilder::new();
+        p_nan.move_to(f32::NAN, 0.0).line_to(10.0, f32::INFINITY).close();
+        let p_nan = p_nan.finish();
+        assert!(simplify_path(&p_nan, FillRule::NonZero, 0.25).is_empty());
+
+        let mut p_huge = PathBuilder::new();
+        p_huge.move_to(-1e30, -1e30).line_to(1e30, -1e30).line_to(1e30, 1e30).line_to(-1e30, 1e30).close();
+        let p_huge = p_huge.finish();
+        let sh = simplify_path(&p_huge, FillRule::NonZero, 0.25);
+        assert!(!sh.is_empty());
+
+        let mut p_sliver = PathBuilder::new();
+        p_sliver.move_to(0.0, 0.0).line_to(100.0, 0.0).line_to(100.0, 1e-7).line_to(0.0, 1e-7).close();
+        let p_sliver = p_sliver.finish();
+        let _ = boolean_op(
+            &p_sliver,
+            &p_sliver,
+            BooleanOp::Xor,
+            FillRule::NonZero,
+            FillRule::NonZero,
+            0.25,
+        );
+
+        let mut p_sub = PathBuilder::new();
+        let sub = f32::MIN_POSITIVE * 0.5;
+        p_sub.move_to(0.0, 0.0).line_to(sub, 0.0).line_to(0.0, sub).close();
+        let p_sub = p_sub.finish();
+        let _ = simplify_path(&p_sub, FillRule::NonZero, 0.25);
     }
 }

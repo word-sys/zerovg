@@ -439,6 +439,7 @@ macro_rules! install_counting_alloc {
     () => {
         mod __zvg_counting_alloc {
             use std::alloc::{GlobalAlloc, Layout, System};
+            use std::cell::Cell;
             use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
             struct CountingAlloc;
@@ -447,26 +448,36 @@ macro_rules! install_counting_alloc {
             static ALLOCS: AtomicUsize = AtomicUsize::new(0);
             static DEALLOCS: AtomicUsize = AtomicUsize::new(0);
 
+            thread_local! {
+                static TRACK_THIS_THREAD: Cell<bool> = const { Cell::new(false) };
+            }
+
+            #[inline]
+            fn is_tracked() -> bool {
+                ACTIVE.load(Ordering::Relaxed)
+                    && TRACK_THIS_THREAD.try_with(|c| c.get()).unwrap_or(false)
+            }
+
             #[global_allocator]
             static GLOBAL: CountingAlloc = CountingAlloc;
 
             unsafe impl GlobalAlloc for CountingAlloc {
                 unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-                    if ACTIVE.load(Ordering::Relaxed) {
+                    if is_tracked() {
                         ALLOCS.fetch_add(1, Ordering::Relaxed);
                     }
                     unsafe { System.alloc(layout) }
                 }
 
                 unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-                    if ACTIVE.load(Ordering::Relaxed) {
+                    if is_tracked() {
                         DEALLOCS.fetch_add(1, Ordering::Relaxed);
                     }
                     unsafe { System.dealloc(ptr, layout) }
                 }
 
                 unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-                    if ACTIVE.load(Ordering::Relaxed) {
+                    if is_tracked() {
                         ALLOCS.fetch_add(1, Ordering::Relaxed);
                     }
                     unsafe { System.realloc(ptr, layout, new_size) }
@@ -476,9 +487,11 @@ macro_rules! install_counting_alloc {
             pub fn assert_zero_allocs<F: FnOnce()>(f: F) {
                 ALLOCS.store(0, Ordering::SeqCst);
                 DEALLOCS.store(0, Ordering::SeqCst);
+                TRACK_THIS_THREAD.with(|c| c.set(true));
                 ACTIVE.store(true, Ordering::SeqCst);
                 f();
                 ACTIVE.store(false, Ordering::SeqCst);
+                TRACK_THIS_THREAD.with(|c| c.set(false));
                 let a = ALLOCS.load(Ordering::SeqCst);
                 let d = DEALLOCS.load(Ordering::SeqCst);
                 assert_eq!(
