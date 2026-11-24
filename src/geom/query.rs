@@ -5,6 +5,7 @@ use crate::math::float::{abs_f64, sqrt_f32, sqrt_f64};
 
 use super::flatten::{DEFAULT_TOLERANCE, flatten_path_segments};
 use super::path::{FillRule, Path, PathEvent};
+use super::stroke::{StrokeStyle, expand_stroke_path};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ClosestPointResult {
@@ -392,10 +393,42 @@ pub fn signed_distance_to_path(
     }
 }
 
+pub fn point_in_stroke(
+    path: &Path,
+    point: Point,
+    style: &StrokeStyle<'_>,
+    tolerance: f32,
+) -> bool {
+    if path.is_empty() || !point.is_finite() || !style.width.is_finite() || style.width <= 0.0 {
+        return false;
+    }
+    let miter = if style.miter_limit.is_finite() && style.miter_limit >= 1.0 {
+        style.miter_limit
+    } else {
+        1.0
+    };
+    let pad = 0.5 * style.width * miter.max(1.42) + tolerance.max(1e-3);
+    let b = path.control_bounds();
+    if point.x < b.min_x - pad
+        || point.x > b.max_x + pad
+        || point.y < b.min_y - pad
+        || point.y > b.max_y + pad
+    {
+        return false;
+    }
+    let stroked = expand_stroke_path(path, Affine2D::IDENTITY, style, tolerance);
+    point_in_fill(&stroked, point, FillRule::NonZero, tolerance)
+}
+
 impl Path {
     #[inline]
     pub fn contains_point(&self, point: Point, fill_rule: FillRule) -> bool {
         point_in_fill(self, point, fill_rule, DEFAULT_TOLERANCE)
+    }
+
+    #[inline]
+    pub fn contains_stroke_point(&self, point: Point, style: &StrokeStyle<'_>) -> bool {
+        point_in_stroke(self, point, style, DEFAULT_TOLERANCE)
     }
 
     #[inline]
@@ -510,5 +543,45 @@ mod tests {
             let d = Point::new(x, y).distance(query);
             assert!(res.distance <= d + 1e-4, "res={} sample={}", res.distance, d);
         }
+    }
+
+    #[test]
+    fn point_in_stroke_caps_joins_and_curves() {
+        use crate::geom::{LineCap, LineJoin, StrokeStyle};
+
+        let mut pb = PathBuilder::new();
+        pb.move_to(20.0, 50.0).line_to(80.0, 50.0);
+        let seg = pb.finish();
+
+        // Point 4px past right endpoint (84, 50) with width=10 (r=5):
+        // Butt = outside, Round = inside (dist 4 < 5), Square = inside (dx=4 < 5)
+        let cap_probe = Point::new(84.0, 50.0);
+        assert!(!seg.contains_stroke_point(cap_probe, &StrokeStyle::new(10.0).with_cap(LineCap::Butt)));
+        assert!(seg.contains_stroke_point(cap_probe, &StrokeStyle::new(10.0).with_cap(LineCap::Round)));
+        assert!(seg.contains_stroke_point(cap_probe, &StrokeStyle::new(10.0).with_cap(LineCap::Square)));
+
+        // Corner of square cap (84, 54): dist = sqrt(32) ~= 5.66 > 5 -> Square inside, Round outside
+        let sq_corner = Point::new(84.0, 54.0);
+        assert!(seg.contains_stroke_point(sq_corner, &StrokeStyle::new(10.0).with_cap(LineCap::Square)));
+        assert!(!seg.contains_stroke_point(sq_corner, &StrokeStyle::new(10.0).with_cap(LineCap::Round)));
+
+        // 90-deg corner join at (50, 50) with width=20 (r=10):
+        // Outer corner (58, 42) has dist sqrt(128) ~= 11.31 (> 10, < 14.14): Miter inside, Round & Bevel outside
+        let mut lpb = PathBuilder::new();
+        lpb.move_to(10.0, 50.0).line_to(50.0, 50.0).line_to(50.0, 90.0);
+        let corner = lpb.finish();
+        let miter_probe = Point::new(58.0, 42.0);
+        assert!(corner.contains_stroke_point(
+            miter_probe,
+            &StrokeStyle::new(20.0).with_join(LineJoin::Miter)
+        ));
+        assert!(!corner.contains_stroke_point(
+            miter_probe,
+            &StrokeStyle::new(20.0).with_join(LineJoin::Round)
+        ));
+        assert!(!corner.contains_stroke_point(
+            miter_probe,
+            &StrokeStyle::new(20.0).with_join(LineJoin::Bevel)
+        ));
     }
 }

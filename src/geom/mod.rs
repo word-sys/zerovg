@@ -16,8 +16,8 @@ pub use flatten::{
 };
 pub use path::{FillRule, Path, PathBuilder, PathEvent, PathIter, PathVerb};
 pub use query::{
-    ClosestPointResult, closest_point_on_path, point_in_fill, signed_distance_to_path,
-    winding_number,
+    ClosestPointResult, closest_point_on_path, point_in_fill, point_in_stroke,
+    signed_distance_to_path, winding_number,
 };
 pub use stroke::{
     CubicSeg, LineCap, LineJoin, OffsetSegment, QuadSeg, StrokeStyle,

@@ -319,7 +319,7 @@ fn tiger_and_torture_scenes_png_and_pinned_sha256() {
     let torture_hash = common::sha256_hex(torture.data());
     assert_eq!(
         torture_hash,
-        "c2a2a574b21b9933c95ef6093b3afdeef2f15f59f3aa2a65498af3ad6df8d386",
+        "e184e55c38c1da8a5ee73fbd285d77eb28c7a340294d32002c5503d10139b129",
         "torture framebuffer SHA-256 drifted: {torture_hash}"
     );
 

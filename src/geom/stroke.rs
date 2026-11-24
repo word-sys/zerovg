@@ -5,7 +5,8 @@ use alloc::vec::Vec;
 use crate::geom::bounds::{cubic_bounds, quad_bounds};
 use crate::geom::path::{Path, PathBuilder, PathEvent};
 use crate::math::affine::{Affine2D, Point, Rect, Vec2};
-use crate::math::float::{abs_f64, copysign_f64, sqrt_f64};
+use crate::math::float::{abs_f64, atan2_f32, ceil_f32, copysign_f64, sincos_f32, sqrt_f64};
+use core::f64::consts::{FRAC_PI_2, PI};
 
 const MAX_OFFSET_DEPTH: u32 = 10;
 const EPS_T: f64 = 1e-6;
@@ -110,6 +111,7 @@ pub struct CubicSeg {
 pub enum OffsetSegment {
     LineTo(Point),
     QuadTo(Point, Point),
+    CubicTo(Point, Point, Point),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -755,9 +757,7 @@ fn emit_reversed_offset(
         let prev_pt = if i == 0 {
             start
         } else {
-            match segs[i - 1] {
-                OffsetSegment::LineTo(p) | OffsetSegment::QuadTo(_, p) => p,
-            }
+            offset_seg_end(segs[i - 1])
         };
         match segs[i] {
             OffsetSegment::LineTo(_) => {
@@ -769,7 +769,22 @@ fn emit_reversed_offset(
                 let p = xform(prev_pt);
                 out.quad_to(c.x, c.y, p.x, p.y);
             }
+            OffsetSegment::CubicTo(c1, c2, _) => {
+                let tc2 = xform(c2);
+                let tc1 = xform(c1);
+                let p = xform(prev_pt);
+                out.cubic_to(tc2.x, tc2.y, tc1.x, tc1.y, p.x, p.y);
+            }
         }
+    }
+}
+
+#[inline]
+fn offset_seg_end(seg: OffsetSegment) -> Point {
+    match seg {
+        OffsetSegment::LineTo(p)
+        | OffsetSegment::QuadTo(_, p)
+        | OffsetSegment::CubicTo(_, _, p) => p,
     }
 }
 
@@ -789,6 +804,183 @@ fn emit_forward_offset(
                 let tp = xform(p);
                 out.quad_to(tc.x, tc.y, tp.x, tp.y);
             }
+            OffsetSegment::CubicTo(c1, c2, p) => {
+                let tc1 = xform(c1);
+                let tc2 = xform(c2);
+                let tp = xform(p);
+                out.cubic_to(tc1.x, tc1.y, tc2.x, tc2.y, tp.x, tp.y);
+            }
+        }
+    }
+}
+
+// Emits <= 90-deg cubic Bezier arc segments rotating unit vector `u0` by `sweep` radians around `center`.
+fn emit_arc_segments(
+    center: DVec2,
+    r: f64,
+    u0: DVec2,
+    u_end: DVec2,
+    sweep: f64,
+    out: &mut Vec<OffsetSegment>,
+) {
+    let abs_sweep = abs_f64(sweep);
+    if abs_sweep < 1e-6 {
+        out.push(OffsetSegment::LineTo(center.add(u_end.scale(r)).to_point()));
+        return;
+    }
+    let segs = (ceil_f32((abs_sweep / FRAC_PI_2) as f32) as usize).clamp(1, 4);
+    let delta = sweep / (segs as f64);
+    let (sh, ch) = sincos_f32((0.25 * delta) as f32);
+    let alpha = (4.0 / 3.0) * ((sh as f64) / (ch as f64));
+    let u0p = u0.perp();
+
+    let rot = |ang: f64| -> DVec2 {
+        let (s, c) = sincos_f32(ang as f32);
+        u0.scale(c as f64).add(u0p.scale(s as f64))
+    };
+
+    let mut v0 = u0;
+    for i in 0..segs {
+        let v1 = if i + 1 == segs {
+            u_end
+        } else {
+            rot(((i + 1) as f64) * delta)
+        };
+        let p0 = center.add(v0.scale(r));
+        let p3 = center.add(v1.scale(r));
+        let c1 = p0.add(v0.perp().scale(r * alpha));
+        let c2 = p3.sub(v1.perp().scale(r * alpha));
+        out.push(OffsetSegment::CubicTo(
+            c1.to_point(),
+            c2.to_point(),
+            p3.to_point(),
+        ));
+        v0 = v1;
+    }
+}
+
+fn emit_arc_path(
+    center: DVec2,
+    r: f64,
+    u0: DVec2,
+    u_end: DVec2,
+    sweep: f64,
+    out: &mut PathBuilder,
+    xform: &dyn Fn(Point) -> Point,
+) {
+    let mut segs = Vec::with_capacity(4);
+    emit_arc_segments(center, r, u0, u_end, sweep, &mut segs);
+    emit_forward_offset(&segs, out, xform);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_cap(
+    pivot: DVec2,
+    outward_tangent: DVec2,
+    from_dir: DVec2,
+    to_dir: DVec2,
+    r: f64,
+    cap: LineCap,
+    out: &mut PathBuilder,
+    xform: &dyn Fn(Point) -> Point,
+) {
+    match cap {
+        LineCap::Butt => {
+            let end_p = xform(pivot.add(to_dir.scale(r)).to_point());
+            out.line_to(end_p.x, end_p.y);
+        }
+        LineCap::Square => {
+            let ext = outward_tangent.scale(r);
+            let p1 = xform(pivot.add(from_dir.scale(r)).add(ext).to_point());
+            let p2 = xform(pivot.add(to_dir.scale(r)).add(ext).to_point());
+            let p3 = xform(pivot.add(to_dir.scale(r)).to_point());
+            out.line_to(p1.x, p1.y);
+            out.line_to(p2.x, p2.y);
+            out.line_to(p3.x, p3.y);
+        }
+        LineCap::Round => {
+            // Both end cap (+N -> -N via +T) and start cap (-N -> +N via -T) sweep -PI.
+            emit_arc_path(pivot, r, from_dir, to_dir, -PI, out, xform);
+        }
+    }
+}
+
+fn emit_zero_length_cap(
+    pivot: Point,
+    r: f64,
+    cap: LineCap,
+    out: &mut PathBuilder,
+    xform: &dyn Fn(Point) -> Point,
+) {
+    match cap {
+        LineCap::Butt => {}
+        LineCap::Square => {
+            let c = DVec2::from_point(pivot);
+            let p0 = xform(DVec2::new(c.x - r, c.y - r).to_point());
+            let p1 = xform(DVec2::new(c.x + r, c.y - r).to_point());
+            let p2 = xform(DVec2::new(c.x + r, c.y + r).to_point());
+            let p3 = xform(DVec2::new(c.x - r, c.y + r).to_point());
+            out.move_to(p0.x, p0.y)
+                .line_to(p1.x, p1.y)
+                .line_to(p2.x, p2.y)
+                .line_to(p3.x, p3.y)
+                .close();
+        }
+        LineCap::Round => {
+            let c = DVec2::from_point(pivot);
+            let start = xform(DVec2::new(c.x + r, c.y).to_point());
+            out.move_to(start.x, start.y);
+            emit_arc_path(
+                c,
+                r,
+                DVec2::new(1.0, 0.0),
+                DVec2::new(-1.0, 0.0),
+                PI,
+                out,
+                xform,
+            );
+            emit_arc_path(
+                c,
+                r,
+                DVec2::new(-1.0, 0.0),
+                DVec2::new(1.0, 0.0),
+                PI,
+                out,
+                xform,
+            );
+            out.close();
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_outer_join(
+    pivot: DVec2,
+    r: f64,
+    u0: DVec2,
+    u1: DVec2,
+    dot: f64,
+    sweep: f64,
+    join: LineJoin,
+    miter_limit_sq: f64,
+    out: &mut Vec<OffsetSegment>,
+) {
+    let target = pivot.add(u1.scale(r)).to_point();
+    match join {
+        LineJoin::Bevel => {
+            out.push(OffsetSegment::LineTo(target));
+        }
+        LineJoin::Miter => {
+            // Exact miter-limit check without sin/sqrt: 1/sin(theta/2) <= M <=> (1 + dot) * M^2 >= 2
+            let denom = 1.0 + dot;
+            if denom > 1e-12 && denom * miter_limit_sq >= 2.0 {
+                let miter = pivot.add(u0.add(u1).scale(r / denom)).to_point();
+                out.push(OffsetSegment::LineTo(miter));
+            }
+            out.push(OffsetSegment::LineTo(target));
+        }
+        LineJoin::Round => {
+            emit_arc_segments(pivot, r, u0, u1, sweep, out);
         }
     }
 }
@@ -798,6 +990,12 @@ struct SubpathStroke {
     left: Vec<OffsetSegment>,
     right_start: Option<Point>,
     right: Vec<OffsetSegment>,
+    first_pivot: Point,
+    first_tangent: Option<DVec2>,
+    last_pivot: Point,
+    last_tangent: Option<DVec2>,
+    has_any_verb: bool,
+    origin: Point,
 }
 
 impl SubpathStroke {
@@ -807,161 +1005,287 @@ impl SubpathStroke {
             left: Vec::new(),
             right_start: None,
             right: Vec::new(),
+            first_pivot: Point::ZERO,
+            first_tangent: None,
+            last_pivot: Point::ZERO,
+            last_tangent: None,
+            has_any_verb: false,
+            origin: Point::ZERO,
         }
     }
 
-    fn clear(&mut self) {
+    fn reset(&mut self, origin: Point) {
         self.left_start = None;
         self.left.clear();
         self.right_start = None;
         self.right.clear();
+        self.first_pivot = origin;
+        self.first_tangent = None;
+        self.last_pivot = origin;
+        self.last_tangent = None;
+        self.has_any_verb = false;
+        self.origin = origin;
     }
 
     fn is_empty(&self) -> bool {
         self.left_start.is_none() || self.left.is_empty()
     }
 
-    fn push_line(&mut self, a: Point, b: Point, half_w: f32) {
+    // Emits outer join + inner bevel-to-pivot cleanup at `pivot` between `prev_t` and `next_t`.
+    fn emit_join_at(
+        &mut self,
+        pivot: Point,
+        prev_t: DVec2,
+        next_t: DVec2,
+        r: f64,
+        join: LineJoin,
+        miter_limit_sq: f64,
+    ) {
+        let pv = DVec2::from_point(pivot);
+        let n0 = prev_t.perp();
+        let n1 = next_t.perp();
+        let dot = prev_t.dot(next_t).clamp(-1.0, 1.0);
+        let cross = prev_t.cross(next_t);
+
+        // Collinear continuation (0-deg turn): offset endpoints already coincide
+        if dot > 1.0 - 1e-6 {
+            return;
+        }
+
+        // 180-deg fold-back U-turn (cross ~= 0, dot ~= -1): inner connects via pivot, outer bevels or rounds
+        if abs_f64(cross) <= 1e-9 && dot < 0.0 {
+            let l1 = pv.add(n1.scale(r)).to_point();
+            let r1 = pv.sub(n1.scale(r)).to_point();
+            if join == LineJoin::Round {
+                emit_arc_segments(pv, r, n0, n1, -PI, &mut self.left);
+                // Inner connects through pivot to prevent negative-winding fold holes
+                self.right.push(OffsetSegment::LineTo(pivot));
+                self.right.push(OffsetSegment::LineTo(r1));
+            } else {
+                self.left.push(OffsetSegment::LineTo(pivot));
+                self.left.push(OffsetSegment::LineTo(l1));
+                self.right.push(OffsetSegment::LineTo(pivot));
+                self.right.push(OffsetSegment::LineTo(r1));
+            }
+            return;
+        }
+
+        let sweep = atan2_f32(cross as f32, dot as f32) as f64;
+        if cross > 0.0 {
+            // Right side (-N) is OUTER; Left side (+N) is INNER (bevel-to-pivot cleanup)
+            let l1 = pv.add(n1.scale(r)).to_point();
+            self.left.push(OffsetSegment::LineTo(pivot));
+            self.left.push(OffsetSegment::LineTo(l1));
+            emit_outer_join(
+                pv,
+                r,
+                n0.scale(-1.0),
+                n1.scale(-1.0),
+                dot,
+                sweep,
+                join,
+                miter_limit_sq,
+                &mut self.right,
+            );
+        } else {
+            // Left side (+N) is OUTER; Right side (-N) is INNER (bevel-to-pivot cleanup)
+            let r1 = pv.sub(n1.scale(r)).to_point();
+            emit_outer_join(pv, r, n0, n1, dot, sweep, join, miter_limit_sq, &mut self.left);
+            self.right.push(OffsetSegment::LineTo(pivot));
+            self.right.push(OffsetSegment::LineTo(r1));
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn connect_segment_start(
+        &mut self,
+        start_pt: Point,
+        start_t: DVec2,
+        ls: Point,
+        rs: Point,
+        r: f64,
+        join: LineJoin,
+        miter_limit_sq: f64,
+    ) {
+        if let Some(prev_t) = self.last_tangent {
+            self.emit_join_at(start_pt, prev_t, start_t, r, join, miter_limit_sq);
+        } else {
+            self.left_start = Some(ls);
+            self.right_start = Some(rs);
+            self.first_pivot = start_pt;
+            self.first_tangent = Some(start_t);
+        }
+    }
+
+    fn push_line(&mut self, a: Point, b: Point, r: f64, join: LineJoin, miter_limit_sq: f64) {
+        self.has_any_verb = true;
         let da = DVec2::from_point(a);
         let db = DVec2::from_point(b);
         let Some(dir) = db.sub(da).normalize() else {
             return;
         };
-        let n = dir.perp().scale(half_w as f64);
+        let n = dir.perp().scale(r);
         let la = da.add(n).to_point();
         let lb = db.add(n).to_point();
         let ra = da.sub(n).to_point();
         let rb = db.sub(n).to_point();
 
-        if self.left_start.is_none() {
-            self.left_start = Some(la);
-            self.right_start = Some(ra);
-        } else {
-            self.left.push(OffsetSegment::LineTo(la));
-            self.right.push(OffsetSegment::LineTo(ra));
-        }
+        self.connect_segment_start(a, dir, la, ra, r, join, miter_limit_sq);
         self.left.push(OffsetSegment::LineTo(lb));
         self.right.push(OffsetSegment::LineTo(rb));
+        self.last_pivot = b;
+        self.last_tangent = Some(dir);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn push_quad(
         &mut self,
         q: QuadSeg,
         half_w: f32,
         tol: f32,
+        join: LineJoin,
+        miter_limit_sq: f64,
         decomposed: &mut Vec<QuadSeg>,
         tmp: &mut Vec<OffsetSegment>,
     ) {
+        self.has_any_verb = true;
         decomposed.clear();
         decompose_quad_for_stroke(q, decomposed);
+        let r = half_w as f64;
         for &sub in decomposed.iter() {
+            let (Some(t0v), Some(t1v)) = (sub.start_unit_tangent(), sub.end_unit_tangent()) else {
+                continue;
+            };
+            let t0 = DVec2::new(t0v.x as f64, t0v.y as f64);
+            let t1 = DVec2::new(t1v.x as f64, t1v.y as f64);
             tmp.clear();
-            if let Some(ls) = offset_quad_subcurve(sub, half_w, tol, tmp) {
-                if self.left_start.is_none() {
-                    self.left_start = Some(ls);
-                } else {
-                    self.left.push(OffsetSegment::LineTo(ls));
-                }
-                self.left.extend_from_slice(tmp);
-            }
-            tmp.clear();
-            if let Some(rs) = offset_quad_subcurve(sub, -half_w, tol, tmp) {
-                if self.right_start.is_none() {
-                    self.right_start = Some(rs);
-                } else {
-                    self.right.push(OffsetSegment::LineTo(rs));
-                }
-                self.right.extend_from_slice(tmp);
-            }
+            let Some(ls) = offset_quad_subcurve(sub, half_w, tol, tmp) else {
+                continue;
+            };
+            let mut right_tmp = Vec::with_capacity(tmp.len());
+            let Some(rs) = offset_quad_subcurve(sub, -half_w, tol, &mut right_tmp) else {
+                continue;
+            };
+            self.connect_segment_start(sub.p0, t0, ls, rs, r, join, miter_limit_sq);
+            self.left.extend_from_slice(tmp);
+            self.right.extend_from_slice(&right_tmp);
+            self.last_pivot = sub.p2;
+            self.last_tangent = Some(t1);
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn push_cubic(
         &mut self,
         c: CubicSeg,
         half_w: f32,
         tol: f32,
+        join: LineJoin,
+        miter_limit_sq: f64,
         decomposed: &mut Vec<CubicSeg>,
         tmp: &mut Vec<OffsetSegment>,
     ) {
+        self.has_any_verb = true;
         decomposed.clear();
         decompose_cubic_for_stroke(c, decomposed);
+        let r = half_w as f64;
         for &sub in decomposed.iter() {
+            let (Some(t0v), Some(t1v)) = (sub.start_unit_tangent(), sub.end_unit_tangent()) else {
+                continue;
+            };
+            let t0 = DVec2::new(t0v.x as f64, t0v.y as f64);
+            let t1 = DVec2::new(t1v.x as f64, t1v.y as f64);
             tmp.clear();
-            if let Some(ls) = offset_cubic_subcurve(sub, half_w, tol, tmp) {
-                if self.left_start.is_none() {
-                    self.left_start = Some(ls);
-                } else {
-                    self.left.push(OffsetSegment::LineTo(ls));
-                }
-                self.left.extend_from_slice(tmp);
-            }
-            tmp.clear();
-            if let Some(rs) = offset_cubic_subcurve(sub, -half_w, tol, tmp) {
-                if self.right_start.is_none() {
-                    self.right_start = Some(rs);
-                } else {
-                    self.right.push(OffsetSegment::LineTo(rs));
-                }
-                self.right.extend_from_slice(tmp);
-            }
+            let Some(ls) = offset_cubic_subcurve(sub, half_w, tol, tmp) else {
+                continue;
+            };
+            let mut right_tmp = Vec::with_capacity(tmp.len());
+            let Some(rs) = offset_cubic_subcurve(sub, -half_w, tol, &mut right_tmp) else {
+                continue;
+            };
+            self.connect_segment_start(sub.p0, t0, ls, rs, r, join, miter_limit_sq);
+            self.left.extend_from_slice(tmp);
+            self.right.extend_from_slice(&right_tmp);
+            self.last_pivot = sub.p3;
+            self.last_tangent = Some(t1);
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn flush_into(
         &mut self,
         closed: bool,
+        r: f64,
+        cap: LineCap,
+        join: LineJoin,
+        miter_limit_sq: f64,
         out: &mut PathBuilder,
         xform: &dyn Fn(Point) -> Point,
     ) {
         if self.is_empty() {
-            self.clear();
+            if self.has_any_verb || closed {
+                emit_zero_length_cap(self.origin, r, cap, out, xform);
+            }
+            self.reset(Point::ZERO);
             return;
         }
-        let Some(ls) = self.left_start else {
-            self.clear();
-            return;
-        };
-        let Some(rs) = self.right_start else {
-            self.clear();
+        let (Some(ls), Some(rs), Some(first_t), Some(last_t)) = (
+            self.left_start,
+            self.right_start,
+            self.first_tangent,
+            self.last_tangent,
+        ) else {
+            self.reset(Point::ZERO);
             return;
         };
 
         if closed {
-            // Outer contour forward
+            // Closing seam join between last segment and first segment at first_pivot
+            self.emit_join_at(self.first_pivot, last_t, first_t, r, join, miter_limit_sq);
+
+            // Outer/Left contour forward
             let tls = xform(ls);
             out.move_to(tls.x, tls.y);
             emit_forward_offset(&self.left, out, xform);
             out.close();
 
-            // Inner contour reversed for opposite winding (NonZero hole)
-            let right_end = match self.right.last() {
-                Some(&OffsetSegment::LineTo(p)) | Some(&OffsetSegment::QuadTo(_, p)) => p,
-                None => rs,
-            };
+            // Inner/Right contour reversed
+            let right_end = self.right.last().copied().map(offset_seg_end).unwrap_or(rs);
             let tre = xform(right_end);
             out.move_to(tre.x, tre.y);
             emit_reversed_offset(rs, &self.right, out, xform);
             out.close();
         } else {
-            // Open subpath: left forward -> connect to right end -> right reversed -> close
+            // Open subpath: left forward -> end cap -> right reversed -> start cap -> close
             let tls = xform(ls);
             out.move_to(tls.x, tls.y);
             emit_forward_offset(&self.left, out, xform);
-            let right_end = match self.right.last() {
-                Some(&OffsetSegment::LineTo(p)) | Some(&OffsetSegment::QuadTo(_, p)) => p,
-                None => rs,
-            };
-            let tre = xform(right_end);
-            out.line_to(tre.x, tre.y);
+
+            let end_pivot = DVec2::from_point(self.last_pivot);
+            let end_n = last_t.perp();
+            emit_cap(end_pivot, last_t, end_n, end_n.scale(-1.0), r, cap, out, xform);
+
             emit_reversed_offset(rs, &self.right, out, xform);
+
+            let start_pivot = DVec2::from_point(self.first_pivot);
+            let start_n = first_t.perp();
+            emit_cap(
+                start_pivot,
+                first_t.scale(-1.0),
+                start_n.scale(-1.0),
+                start_n,
+                r,
+                cap,
+                out,
+                xform,
+            );
             out.close();
         }
-        self.clear();
+        self.reset(Point::ZERO);
     }
 }
 
-// Expands a path stroke into a filled outline in device space, honoring user-space vs non-scaling modes.
+// Expands a path stroke into a filled outline in device space, honoring caps, joins, and transform mode.
 pub fn expand_stroke_into(
     path: &Path,
     transform: Affine2D,
@@ -979,7 +1303,14 @@ pub fn expand_stroke_into(
     }
 
     let half_w = 0.5 * style.width;
+    let r = half_w as f64;
     let base_tol = tolerance.max(1e-4);
+    let miter_lim = if style.miter_limit.is_finite() && style.miter_limit >= 1.0 {
+        style.miter_limit as f64
+    } else {
+        1.0
+    };
+    let miter_limit_sq = miter_lim * miter_lim;
 
     let (in_xform, out_xform, work_tol) = if style.non_scaling {
         (transform, Affine2D::IDENTITY, base_tol)
@@ -1017,20 +1348,22 @@ pub fn expand_stroke_into(
         match ev {
             PathEvent::MoveTo(p) => {
                 if in_subpath {
-                    sub.flush_into(false, out, &map_out);
+                    sub.flush_into(false, r, style.cap, style.join, miter_limit_sq, out, &map_out);
                 }
                 let tp = map_in(p);
                 cur = tp;
                 sub_start = tp;
                 in_subpath = true;
+                sub.reset(tp);
             }
             PathEvent::LineTo(p) => {
                 let tp = map_in(p);
                 if in_subpath {
-                    sub.push_line(cur, tp, half_w);
+                    sub.push_line(cur, tp, r, style.join, miter_limit_sq);
                 } else {
                     sub_start = tp;
                     in_subpath = true;
+                    sub.reset(tp);
                 }
                 cur = tp;
             }
@@ -1038,10 +1371,19 @@ pub fn expand_stroke_into(
                 let tc = map_in(c);
                 let tp = map_in(p);
                 if in_subpath {
-                    sub.push_quad(QuadSeg::new(cur, tc, tp), half_w, work_tol, &mut quad_buf, &mut tmp_segs);
+                    sub.push_quad(
+                        QuadSeg::new(cur, tc, tp),
+                        half_w,
+                        work_tol,
+                        style.join,
+                        miter_limit_sq,
+                        &mut quad_buf,
+                        &mut tmp_segs,
+                    );
                 } else {
                     sub_start = tp;
                     in_subpath = true;
+                    sub.reset(tp);
                 }
                 cur = tp;
             }
@@ -1054,21 +1396,24 @@ pub fn expand_stroke_into(
                         CubicSeg::new(cur, tc1, tc2, tp),
                         half_w,
                         work_tol,
+                        style.join,
+                        miter_limit_sq,
                         &mut cubic_buf,
                         &mut tmp_segs,
                     );
                 } else {
                     sub_start = tp;
                     in_subpath = true;
+                    sub.reset(tp);
                 }
                 cur = tp;
             }
             PathEvent::Close => {
                 if in_subpath {
                     if cur != sub_start {
-                        sub.push_line(cur, sub_start, half_w);
+                        sub.push_line(cur, sub_start, r, style.join, miter_limit_sq);
                     }
-                    sub.flush_into(true, out, &map_out);
+                    sub.flush_into(true, r, style.cap, style.join, miter_limit_sq, out, &map_out);
                     cur = sub_start;
                     in_subpath = false;
                 }
@@ -1077,7 +1422,7 @@ pub fn expand_stroke_into(
     }
 
     if in_subpath {
-        sub.flush_into(false, out, &map_out);
+        sub.flush_into(false, r, style.cap, style.join, miter_limit_sq, out, &map_out);
     }
 }
 
@@ -1290,5 +1635,199 @@ mod tests {
             let st = expand_stroke_path(&p, Affine2D::IDENTITY, &StrokeStyle::new(width), 0.25);
             assert_path_finite_and_within(&st, c.bounds(), 0.5 * width + 0.5);
         }
+    }
+
+    #[test]
+    fn all_9_cap_join_combinations_angles_and_miter_boundary() {
+        use crate::geom::query::point_in_fill;
+        use crate::math::float::sincos_f32;
+
+        // Test all 9 (LineCap x LineJoin) combinations across 5 deg (acute), 90 deg, 175 deg (obtuse), and 180 deg fold-back
+        let angles_deg = [5.0f32, 90.0, 175.0, 180.0];
+        let caps = [LineCap::Butt, LineCap::Round, LineCap::Square];
+        let joins = [LineJoin::Miter, LineJoin::Round, LineJoin::Bevel];
+
+        for &deg in &angles_deg {
+            let rad = deg * (core::f32::consts::PI / 180.0);
+            let (s, c) = sincos_f32(rad);
+            let mut pb = PathBuilder::new();
+            // Arm 1: (100, 0) -> (0, 0), Arm 2: (0, 0) -> (100*cos(deg), 100*sin(deg))
+            // Wait: interior angle between the two arms is `deg`!
+            pb.move_to(100.0, 0.0)
+                .line_to(0.0, 0.0)
+                .line_to(100.0 * c, 100.0 * s);
+            let v_path = pb.finish();
+
+            for &cap in &caps {
+                for &join in &joins {
+                    let style = StrokeStyle::new(20.0)
+                        .with_cap(cap)
+                        .with_join(join)
+                        .with_miter_limit(4.0);
+                    let st = expand_stroke_path(&v_path, Affine2D::IDENTITY, &style, 0.1);
+                    assert!(!st.is_empty());
+                    for &p in st.points() {
+                        assert!(p.is_finite(), "deg={deg} cap={cap:?} join={join:?}");
+                    }
+                    // Vertex pivot (0, 0) must ALWAYS be covered with zero inner-cusp hole!
+                    assert!(
+                        point_in_fill(&st, Point::new(0.0, 0.0), crate::geom::FillRule::NonZero, 0.1),
+                        "pivot hole for deg={deg} cap={cap:?} join={join:?}"
+                    );
+                }
+            }
+        }
+
+        // Exact miter-limit transition boundary at interior angle 60 deg:
+        // sin(30 deg) = 0.5 => exact miter ratio = 1 / 0.5 = 2.0, miter tip at distance 2.0 * r = 20.0 from (0,0)
+        let rad60 = 60.0f32 * (core::f32::consts::PI / 180.0);
+        let (s60, c60) = sincos_f32(rad60);
+        let mut mpb = PathBuilder::new();
+        mpb.move_to(100.0, 0.0)
+            .line_to(0.0, 0.0)
+            .line_to(100.0 * c60, 100.0 * s60);
+        let v60 = mpb.finish();
+
+        // Point along the outward bisector at distance 16.0 (> bevel distance ~8.66, < miter tip 20.0)
+        let bis_rad = 210.0f32 * (core::f32::consts::PI / 180.0);
+        let (sb, cb) = sincos_f32(bis_rad);
+        let probe = Point::new(16.0 * cb, 16.0 * sb);
+
+        let miter_ok = expand_stroke_path(
+            &v60,
+            Affine2D::IDENTITY,
+            &StrokeStyle::new(20.0).with_join(LineJoin::Miter).with_miter_limit(2.01),
+            0.1,
+        );
+        let miter_bevel = expand_stroke_path(
+            &v60,
+            Affine2D::IDENTITY,
+            &StrokeStyle::new(20.0).with_join(LineJoin::Miter).with_miter_limit(1.99),
+            0.1,
+        );
+        assert!(point_in_fill(&miter_ok, probe, crate::geom::FillRule::NonZero, 0.1));
+        assert!(!point_in_fill(&miter_bevel, probe, crate::geom::FillRule::NonZero, 0.1));
+    }
+
+    #[test]
+    fn zero_length_subpaths_cap_semantics() {
+        let mut p_line = PathBuilder::new();
+        p_line.move_to(50.0, 50.0).line_to(50.0, 50.0);
+        let mut p_close = PathBuilder::new();
+        p_close.move_to(50.0, 50.0).close();
+        let mut p_cubic = PathBuilder::new();
+        p_cubic
+            .move_to(50.0, 50.0)
+            .cubic_to(50.0, 50.0, 50.0, 50.0, 50.0, 50.0);
+
+        for path in [p_line.finish(), p_close.finish(), p_cubic.finish()] {
+            // Butt -> empty
+            let butt = expand_stroke_path(
+                &path,
+                Affine2D::IDENTITY,
+                &StrokeStyle::new(20.0).with_cap(LineCap::Butt),
+                0.1,
+            );
+            assert!(butt.is_empty());
+
+            // Square -> 20x20 square centered at (50, 50)
+            let sq = expand_stroke_path(
+                &path,
+                Affine2D::IDENTITY,
+                &StrokeStyle::new(20.0).with_cap(LineCap::Square),
+                0.1,
+            );
+            let sb = path_tight_bounds(&sq);
+            assert!(abs_f32(sb.min_x - 40.0) < 1e-3 && abs_f32(sb.max_x - 60.0) < 1e-3);
+            assert!(abs_f32(sb.min_y - 40.0) < 1e-3 && abs_f32(sb.max_y - 60.0) < 1e-3);
+
+            // Round -> circle of radius 10 centered at (50, 50)
+            let rnd = expand_stroke_path(
+                &path,
+                Affine2D::IDENTITY,
+                &StrokeStyle::new(20.0).with_cap(LineCap::Round),
+                0.1,
+            );
+            let rb = path_tight_bounds(&rnd);
+            assert!(abs_f32(rb.min_x - 40.0) < 0.05 && abs_f32(rb.max_x - 60.0) < 0.05);
+            assert!(abs_f32(rb.min_y - 40.0) < 0.05 && abs_f32(rb.max_y - 60.0) < 0.05);
+            assert!(crate::geom::query::point_in_fill(
+                &rnd,
+                Point::new(50.0, 50.0),
+                crate::geom::FillRule::NonZero,
+                0.1
+            ));
+            // Corner (59, 59) is at distance sqrt(162) ~= 12.73 > 10 -> inside square, outside round
+            assert!(crate::geom::query::point_in_fill(
+                &sq,
+                Point::new(59.0, 59.0),
+                crate::geom::FillRule::NonZero,
+                0.1
+            ));
+            assert!(!crate::geom::query::point_in_fill(
+                &rnd,
+                Point::new(59.0, 59.0),
+                crate::geom::FillRule::NonZero,
+                0.1
+            ));
+        }
+    }
+
+    #[test]
+    fn translucent_stroked_star_has_uniform_opacity_no_double_blend() {
+        use crate::math::color::Color;
+        use crate::math::dither::DitherMode;
+        use crate::scene::Context;
+        use crate::surface::Surface;
+
+        // 5-point acute self-intersecting star stroked with alpha = 0.5 white over black
+        let mut spb = PathBuilder::new();
+        for i in 0..5 {
+            let ang = ((i * 2) as f32) * (core::f32::consts::TAU / 5.0)
+                - core::f32::consts::FRAC_PI_2;
+            let (s, c) = crate::math::float::sincos_f32(ang);
+            let x = 64.0 + 46.0 * c;
+            let y = 64.0 + 46.0 * s;
+            if i == 0 {
+                spb.move_to(x, y);
+            } else {
+                spb.line_to(x, y);
+            }
+        }
+        spb.close();
+        let star = spb.finish();
+
+        let mut surf = Surface::new_rgba8(128, 128).unwrap();
+        {
+            let mut ctx = Context::new(&mut surf);
+            ctx.set_dither_mode(DitherMode::None);
+            ctx.clear(Color::BLACK);
+            ctx.set_paint(Color::new(1.0, 1.0, 1.0, 0.5));
+            let style = StrokeStyle::new(8.0)
+                .with_join(LineJoin::Miter)
+                .with_miter_limit(10.0);
+            ctx.stroke(&star, &style);
+        }
+
+        // 50% linear white over black maps to ~188 sRGB. No pixel anywhere in the framebuffer may exceed 190
+        // (double-blending at vertices/intersections would yield 75% linear = ~225 sRGB!).
+        let mut max_r = 0u8;
+        let mut bright_count = 0usize;
+        for y in 0..128u32 {
+            let row = surf.row(y).unwrap();
+            for px in row.chunks_exact(4) {
+                if px[0] > max_r {
+                    max_r = px[0];
+                }
+                if px[0] >= 184 {
+                    bright_count += 1;
+                }
+            }
+        }
+        assert!(bright_count > 500, "stroke too sparse: {bright_count}");
+        assert!(
+            max_r <= 190,
+            "double-blending detected at overlapping stroke joints: max_r={max_r}"
+        );
     }
 }
