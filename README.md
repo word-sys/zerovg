@@ -1,6 +1,6 @@
 # ZeroVG
 
-[![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Rust: 1.85+](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
 [![Dependencies: 0](https://img.shields.io/badge/dependencies-0-brightgreen.svg)](Cargo.toml)
 [![no_std](https://img.shields.io/badge/no__std-alloc-informational.svg)](src/lib.rs)
@@ -134,4 +134,4 @@ cargo clippy --all-features --all-targets -- -D warnings
 
 ## License
 
-ZeroVG is licensed under the **GNU General Public License v3.0** — see [LICENSE](LICENSE) for details.
+ZeroVG is licensed under the **Apache License, Version 2.0** — see [LICENSE](LICENSE) for details.

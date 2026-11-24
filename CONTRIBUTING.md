@@ -27,4 +27,4 @@ cargo clippy --all-features --all-targets -- -D warnings
 ## Community & Licensing
 
 - All contributors are expected to uphold our [Code of Conduct](CODE_OF_CONDUCT.md).
-- Contributions are licensed under **GPL-3.0** (matching [LICENSE](LICENSE)).
+- Contributions are licensed under the **Apache License, Version 2.0** (`Apache-2.0`, matching [LICENSE](LICENSE)).

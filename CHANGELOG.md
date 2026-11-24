@@ -6,6 +6,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-11-24
+
+### Added
+- Analytical cubic/quadratic inflection, cusp, near-cusp loop, and $x/y$-extrema stroke decomposition (`geom::stroke`) with user-space and `non_scaling` stroke modes.
+- Full `LineCap` (`Butt`, `Round`, `Square`, including zero-length subpath caps), `LineJoin` (`Miter` with exact sin-free miter-limit bevel fallback, `Round`, `Bevel`), inner-cusp bevel-to-pivot cleanup, and `point_in_stroke` hit-testing.
+- Adaptive 5-point Gauss-Legendre arc-length dash walker (`geom::dash`) with de Casteljau curve preservation, odd-array duplication, negative offset wrapping, zero-length dot dashes, closed-path seam merging, and `Context::set_dash` / `clear_dash`.
+- Exact `i128` predicates (`orient2d`, symmetric rational `intersect_segments`), slab-sorted active-edge sweep-line (`collect_hot_pixels`), Hobby's Iterated Snap-Rounding (`hobby_snap_round`), planar arrangement boolean operations (`Union`, `Intersection`, `Difference`, `Xor`, `Simplify`), and morphological polygon offsetting (`offset_path`) under the `boolean` feature.
+
+### Changed
+- Relicensed project to **Apache License, Version 2.0** (`Apache-2.0`).
+
 ## [0.1.0] - 2026-11-24
 
 Initial `v0.1` release delivering the complete zero-dependency `#![no_std]` + `alloc` 2D vector rasterization core, linear-light color pipeline, pure-Rust image codecs, and dual modern/Cairo-stateful drawing API.
@@ -40,5 +51,6 @@ Initial `v0.1` release delivering the complete zero-dependency `#![no_std]` + `a
 - Scalar linear-light tile compositing blitters (`TileBuffer16` `8 KB` and `TileBufferF32` `16 KB` for HDR & wide-gamut Display P3) with load/blend/dithered-store and partial edge-tile bounds safety.
 - Immediate-mode and Cairo-compatible stateful `Context` v1 (`save`/`restore`, transforms, `fill`, `stroke`, `move_to`/`line_to`/`curve_to`/`arc`/`arc_negative`/`rectangle`/`fill_preserve`/`fill_current`/`paint_with_alpha`/`path_extents`/`copy_path_flat`, and deferred tile-batch `flush()`).
 
-[Unreleased]: https://github.com/word-sys/zerovg/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/word-sys/zerovg/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/word-sys/zerovg/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/word-sys/zerovg/releases/tag/v0.1.0

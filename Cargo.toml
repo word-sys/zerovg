@@ -1,9 +1,9 @@
 [package]
 name = "zerovg"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.85"
-license = "GPL-3.0"
+license = "Apache-2.0"
 description = "Zero-dependency 2D vector graphics and typography engine written in pure Rust with a C ABI"
 readme = "README.md"
 homepage = "https://github.com/word-sys/zerovg"

@@ -30,7 +30,7 @@ pub use surface::{PixelFormat, Surface, SurfaceMut, SurfaceRef};
 
 pub const VERSION_MAJOR: u32 = 0;
 pub const VERSION_MINOR: u32 = 1;
-pub const VERSION_PATCH: u32 = 0;
+pub const VERSION_PATCH: u32 = 1;
 pub const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
 
 #[cfg(test)]
@@ -39,7 +39,7 @@ mod tests {
 
     #[test]
     fn version_matches_cargo() {
-        assert_eq!(VERSION_STR, "0.1.0");
-        assert_eq!((VERSION_MAJOR, VERSION_MINOR, VERSION_PATCH), (0, 1, 0));
+        assert_eq!(VERSION_STR, "0.1.1");
+        assert_eq!((VERSION_MAJOR, VERSION_MINOR, VERSION_PATCH), (0, 1, 1));
     }
 }
