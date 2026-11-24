@@ -2,4 +2,5 @@
 
 pub mod context;
 
-pub use context::{Context, StrokeStyle};
+pub use crate::geom::{LineCap, LineJoin, StrokeStyle};
+pub use context::Context;

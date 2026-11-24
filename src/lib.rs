@@ -17,13 +17,13 @@ pub mod surface;
 pub mod tile;
 
 pub use error::{Result, ZvgError};
-pub use geom::{FillRule, Path, PathBuilder, PathEvent, PathVerb};
+pub use geom::{FillRule, LineCap, LineJoin, Path, PathBuilder, PathEvent, PathVerb, StrokeStyle};
 pub use math::{
     Affine2D, Color, ColorSpace, DitherMode, IRect, LinearRgba16, LinearRgbaF32, Oklab, Oklch,
     Point, Rect, Vec2,
 };
 pub use raster::AntialiasMode;
-pub use scene::{Context, StrokeStyle};
+pub use scene::Context;
 pub use surface::{PixelFormat, Surface, SurfaceMut, SurfaceRef};
 
 pub const VERSION_MAJOR: u32 = 0;

@@ -5,6 +5,7 @@ use alloc::vec::Vec;
 use crate::error::{Result, ZvgError};
 use crate::geom::bounds::path_tight_bounds;
 use crate::geom::flatten::{DEFAULT_TOLERANCE, flatten_path_for_fill, flatten_path_segments};
+use crate::geom::stroke::{LineCap, LineJoin, StrokeStyle, expand_stroke_into};
 use crate::geom::{FillRule, Path, PathBuilder};
 use crate::math::affine::{Affine2D, Point, Rect, Vec2};
 use crate::math::arena::{FrameArena, NO_CHUNK, TILE_SIZE, TileCmd, TileCmdKind};
@@ -21,31 +22,6 @@ use crate::raster::{AntialiasMode, CoverageSpan, TileFillParams, TileRasterScrat
 use crate::surface::{Surface, SurfaceMut};
 use crate::tile::{TILE_FLAG_CRISP_EDGES, TILE_FLAG_OPAQUE, TileBinner};
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct StrokeStyle {
-    pub width: f32,
-    pub miter_limit: f32,
-    pub non_scaling: bool,
-}
-
-impl Default for StrokeStyle {
-    #[inline]
-    fn default() -> Self {
-        Self::new(1.0)
-    }
-}
-
-impl StrokeStyle {
-    #[inline]
-    pub const fn new(width: f32) -> Self {
-        Self {
-            width,
-            miter_limit: 4.0,
-            non_scaling: false,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy)]
 struct ContextState {
     transform: Affine2D,
@@ -54,7 +30,11 @@ struct ContextState {
     antialias: AntialiasMode,
     dither_mode: DitherMode,
     tolerance: f32,
-    stroke_style: StrokeStyle,
+    line_width: f32,
+    line_cap: LineCap,
+    line_join: LineJoin,
+    miter_limit: f32,
+    non_scaling_stroke: bool,
 }
 
 impl Default for ContextState {
@@ -66,7 +46,11 @@ impl Default for ContextState {
             antialias: AntialiasMode::Analytic,
             dither_mode: DitherMode::BlueNoise,
             tolerance: DEFAULT_TOLERANCE,
-            stroke_style: StrokeStyle::default(),
+            line_width: 1.0,
+            line_cap: LineCap::Butt,
+            line_join: LineJoin::Miter,
+            miter_limit: 4.0,
+            non_scaling_stroke: false,
         }
     }
 }
@@ -273,23 +257,67 @@ impl<'a> Context<'a> {
     #[inline]
     pub fn set_line_width(&mut self, width: f32) {
         if width.is_finite() && width >= 0.0 {
-            self.state.stroke_style.width = width;
+            self.state.line_width = width;
         }
     }
 
     #[inline]
     pub fn line_width(&self) -> f32 {
-        self.state.stroke_style.width
+        self.state.line_width
     }
 
     #[inline]
-    pub fn set_stroke_style(&mut self, style: StrokeStyle) {
-        self.state.stroke_style = style;
+    pub fn set_line_cap(&mut self, cap: LineCap) {
+        self.state.line_cap = cap;
     }
 
     #[inline]
-    pub fn stroke_style(&self) -> StrokeStyle {
-        self.state.stroke_style
+    pub fn line_cap(&self) -> LineCap {
+        self.state.line_cap
+    }
+
+    #[inline]
+    pub fn set_line_join(&mut self, join: LineJoin) {
+        self.state.line_join = join;
+    }
+
+    #[inline]
+    pub fn line_join(&self) -> LineJoin {
+        self.state.line_join
+    }
+
+    #[inline]
+    pub fn set_miter_limit(&mut self, miter_limit: f32) {
+        if miter_limit.is_finite() && miter_limit >= 1.0 {
+            self.state.miter_limit = miter_limit;
+        }
+    }
+
+    #[inline]
+    pub fn miter_limit(&self) -> f32 {
+        self.state.miter_limit
+    }
+
+    #[inline]
+    pub fn set_stroke_style(&mut self, style: StrokeStyle<'_>) {
+        self.set_line_width(style.width);
+        self.state.line_cap = style.cap;
+        self.state.line_join = style.join;
+        self.set_miter_limit(style.miter_limit);
+        self.state.non_scaling_stroke = style.non_scaling;
+    }
+
+    #[inline]
+    pub fn stroke_style(&self) -> StrokeStyle<'static> {
+        StrokeStyle {
+            width: self.state.line_width,
+            cap: self.state.line_cap,
+            join: self.state.line_join,
+            miter_limit: self.state.miter_limit,
+            dash_array: None,
+            dash_offset: 0.0,
+            non_scaling: self.state.non_scaling_stroke,
+        }
     }
 
     // Clears the entire surface; supersedes any previously queued commands.
@@ -312,34 +340,20 @@ impl<'a> Context<'a> {
         self.fill_internal(path, self.state.transform, fill_rule, color);
     }
 
-    // Basic v0.1 stroke expansion (upgraded to full analytical inflection/cusp/cap/join/dash in Phase 4).
-    pub fn stroke(&mut self, path: &Path, style: &StrokeStyle) {
+    pub fn stroke(&mut self, path: &Path, style: &StrokeStyle<'_>) {
         if path.is_empty() || !style.width.is_finite() || style.width <= 0.0 {
             return;
         }
-        let transform = self.state.transform;
-        let half_w = 0.5 * style.width;
-        let tol = self.state.tolerance;
-
-        self.stroke_builder.clear();
-        if style.non_scaling {
-            flatten_path_segments(path, transform, tol, false, &mut |a, b| {
-                push_stroke_quad(&mut self.stroke_builder, a, b, half_w);
-            });
-            if self.stroke_builder.finish_into(&mut self.scratch_path).is_ok() {
-                let color = self.state.paint;
-                self.fill_scratch_path(Affine2D::IDENTITY, FillRule::NonZero, color);
-            }
-        } else {
-            let max_s = transform.max_scale_factor().max(1e-4);
-            let user_tol = (tol / max_s).max(1e-4);
-            flatten_path_segments(path, Affine2D::IDENTITY, user_tol, false, &mut |a, b| {
-                push_stroke_quad(&mut self.stroke_builder, a, b, half_w);
-            });
-            if self.stroke_builder.finish_into(&mut self.scratch_path).is_ok() {
-                let color = self.state.paint;
-                self.fill_scratch_path(transform, FillRule::NonZero, color);
-            }
+        expand_stroke_into(
+            path,
+            self.state.transform,
+            style,
+            self.state.tolerance,
+            &mut self.stroke_builder,
+        );
+        if self.stroke_builder.finish_into(&mut self.scratch_path).is_ok() {
+            let color = self.state.paint;
+            self.fill_scratch_path(Affine2D::IDENTITY, FillRule::NonZero, color);
         }
     }
 
@@ -467,7 +481,7 @@ impl<'a> Context<'a> {
             return;
         }
         if let Ok(path) = self.current_path.try_finish() {
-            let style = self.state.stroke_style;
+            let style = self.stroke_style();
             self.stroke(&path, &style);
         }
     }
@@ -823,19 +837,6 @@ impl Drop for Context<'_> {
     fn drop(&mut self) {
         self.flush();
     }
-}
-
-fn push_stroke_quad(pb: &mut PathBuilder, a: Point, b: Point, half_w: f32) {
-    let d = b - a;
-    let Some(dir) = d.normalize() else {
-        return;
-    };
-    let n = dir.perp() * half_w;
-    pb.move_to(a.x + n.x, a.y + n.y)
-        .line_to(b.x + n.x, b.y + n.y)
-        .line_to(b.x - n.x, b.y - n.y)
-        .line_to(a.x - n.x, a.y - n.y)
-        .close();
 }
 
 #[cfg(test)]
