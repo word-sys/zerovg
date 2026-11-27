@@ -11,6 +11,7 @@ pub mod codec;
 pub mod error;
 pub mod geom;
 pub mod math;
+pub mod paint;
 pub mod raster;
 pub mod scene;
 pub mod surface;
@@ -23,6 +24,9 @@ pub use geom::{FillRule, LineCap, LineJoin, Path, PathBuilder, PathEvent, PathVe
 pub use math::{
     Affine2D, Color, ColorSpace, DitherMode, IRect, LinearRgba16, LinearRgbaF32, Oklab, Oklch,
     Point, Rect, Vec2,
+};
+pub use paint::{
+    ColorStop, ConicGradient, InterpolationSpace, LinearGradient, Paint, RadialGradient, SpreadMode,
 };
 pub use raster::AntialiasMode;
 pub use scene::Context;

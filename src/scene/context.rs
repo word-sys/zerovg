@@ -12,20 +12,23 @@ use crate::math::arena::{FrameArena, NO_CHUNK, TILE_SIZE, TileCmd, TileCmdKind};
 use crate::math::color::{Color, LinearRgba16, LinearRgbaF32};
 use crate::math::dither::DitherMode;
 use crate::math::float::clamp_finite_f32;
+use crate::paint::Paint;
+use crate::paint::gradient::PreparedGradient;
 use crate::raster::simd::{
-    TileBuffer16, TileBufferF32, fill_cov_span_src_over_f32, fill_cov_span_src_over_u16,
-    fill_solid_span_src_over_f32, fill_solid_span_src_over_u16, fill_solid_tile_src_over_f32,
-    fill_solid_tile_src_over_u16, load_tile_f32, load_tile_u16, store_tile_f32, store_tile_u16,
-    surface_uses_f32_pipeline,
+    TileBuffer16, TileBufferF32, blend_cov_span_src_over_f32, blend_cov_span_src_over_u16,
+    blend_span_src_over_f32, blend_span_src_over_u16, fill_cov_span_src_over_f32,
+    fill_cov_span_src_over_u16, fill_solid_span_src_over_f32, fill_solid_span_src_over_u16,
+    fill_solid_tile_src_over_f32, fill_solid_tile_src_over_u16, load_tile_f32, load_tile_u16,
+    store_tile_f32, store_tile_u16, surface_uses_f32_pipeline,
 };
 use crate::raster::{AntialiasMode, CoverageSpan, TileFillParams, TileRasterScratch};
 use crate::surface::{Surface, SurfaceMut};
 use crate::tile::{TILE_FLAG_CRISP_EDGES, TILE_FLAG_OPAQUE, TileBinner};
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct ContextState {
     transform: Affine2D,
-    paint: Color,
+    paint: Paint,
     fill_rule: FillRule,
     antialias: AntialiasMode,
     dither_mode: DitherMode,
@@ -44,7 +47,7 @@ impl Default for ContextState {
     fn default() -> Self {
         Self {
             transform: Affine2D::IDENTITY,
-            paint: Color::BLACK,
+            paint: Paint::Solid(Color::BLACK),
             fill_rule: FillRule::NonZero,
             antialias: AntialiasMode::Analytic,
             dither_mode: DitherMode::BlueNoise,
@@ -61,6 +64,18 @@ impl Default for ContextState {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum DrawPaint16 {
+    Solid(LinearRgba16),
+    Gradient(usize),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DrawPaintF32 {
+    Solid(LinearRgbaF32),
+    Gradient(usize),
+}
+
 pub struct Context<'a> {
     surface: SurfaceMut<'a>,
     state: ContextState,
@@ -74,8 +89,9 @@ pub struct Context<'a> {
     scratch: TileRasterScratch,
     tile_buf16: TileBuffer16,
     tile_buf_f32: TileBufferF32,
-    draw_colors16: Vec<LinearRgba16>,
-    draw_colors_f32: Vec<LinearRgbaF32>,
+    draw_paints16: Vec<DrawPaint16>,
+    draw_paints_f32: Vec<DrawPaintF32>,
+    draw_gradients: Vec<PreparedGradient>,
     pending_clear: Option<Color>,
     use_f32: bool,
 }
@@ -104,8 +120,9 @@ impl<'a> Context<'a> {
             scratch: TileRasterScratch::new(),
             tile_buf16: TileBuffer16::new(),
             tile_buf_f32: TileBufferF32::new(),
-            draw_colors16: Vec::new(),
-            draw_colors_f32: Vec::new(),
+            draw_paints16: Vec::new(),
+            draw_paints_f32: Vec::new(),
+            draw_gradients: Vec::new(),
             pending_clear: None,
             use_f32,
         }
@@ -123,7 +140,7 @@ impl<'a> Context<'a> {
 
     #[inline]
     pub fn save(&mut self) {
-        self.state_stack.push(self.state);
+        self.state_stack.push(self.state.clone());
     }
 
     #[inline]
@@ -203,23 +220,35 @@ impl<'a> Context<'a> {
     }
 
     #[inline]
-    pub fn set_paint(&mut self, color: Color) {
-        self.state.paint = color;
+    pub fn set_paint(&mut self, paint: impl Into<Paint>) {
+        let mut p = paint.into();
+        if !self.use_f32 {
+            p.bake();
+        }
+        self.state.paint = p;
     }
 
     #[inline]
     pub fn set_source_rgb(&mut self, r: f32, g: f32, b: f32) {
-        self.state.paint = Color::from_rgb(r, g, b);
+        self.state.paint = Paint::Solid(Color::from_rgb(r, g, b));
     }
 
     #[inline]
     pub fn set_source_rgba(&mut self, r: f32, g: f32, b: f32, a: f32) {
-        self.state.paint = Color::new(r, g, b, a);
+        self.state.paint = Paint::Solid(Color::new(r, g, b, a));
+    }
+
+    #[inline]
+    pub fn current_paint(&self) -> &Paint {
+        &self.state.paint
     }
 
     #[inline]
     pub fn paint_color(&self) -> Color {
-        self.state.paint
+        match self.state.paint {
+            Paint::Solid(c) => c,
+            _ => Color::TRANSPARENT,
+        }
     }
 
     #[inline]
@@ -365,18 +394,28 @@ impl<'a> Context<'a> {
         let h = self.surface.height();
         self.arena.reset();
         self.binner.reset(w, h);
-        self.draw_colors16.clear();
-        self.draw_colors_f32.clear();
+        self.draw_paints16.clear();
+        self.draw_paints_f32.clear();
+        self.draw_gradients.clear();
         self.pending_clear = Some(color);
     }
 
     // Modern immutable path fill API.
     pub fn fill(&mut self, path: &Path, fill_rule: FillRule) {
-        self.fill_internal(path, self.state.transform, fill_rule, self.state.paint);
+        let transform = self.state.transform;
+        let paint = self.state.paint.clone();
+        self.fill_internal(path, transform, fill_rule, &paint, transform);
     }
 
-    pub fn fill_with_paint(&mut self, path: &Path, fill_rule: FillRule, color: Color) {
-        self.fill_internal(path, self.state.transform, fill_rule, color);
+    pub fn fill_with_paint(
+        &mut self,
+        path: &Path,
+        fill_rule: FillRule,
+        paint: impl Into<Paint>,
+    ) {
+        let transform = self.state.transform;
+        let paint = paint.into();
+        self.fill_internal(path, transform, fill_rule, &paint, transform);
     }
 
     pub fn stroke(&mut self, path: &Path, style: &StrokeStyle<'_>) {
@@ -391,8 +430,9 @@ impl<'a> Context<'a> {
             &mut self.stroke_builder,
         );
         if self.stroke_builder.finish_into(&mut self.scratch_path).is_ok() {
-            let color = self.state.paint;
-            self.fill_scratch_path(Affine2D::IDENTITY, FillRule::NonZero, color);
+            let paint = self.state.paint.clone();
+            let paint_ctm = self.state.transform;
+            self.fill_scratch_path(Affine2D::IDENTITY, FillRule::NonZero, &paint, paint_ctm);
         }
     }
 
@@ -494,8 +534,8 @@ impl<'a> Context<'a> {
         {
             let transform = self.state.transform;
             let fill_rule = self.state.fill_rule;
-            let color = self.state.paint;
-            self.fill_scratch_path(transform, fill_rule, color);
+            let paint = self.state.paint.clone();
+            self.fill_scratch_path(transform, fill_rule, &paint, transform);
         }
     }
 
@@ -510,8 +550,8 @@ impl<'a> Context<'a> {
         {
             let transform = self.state.transform;
             let fill_rule = self.state.fill_rule;
-            let color = self.state.paint;
-            self.fill_scratch_path(transform, fill_rule, color);
+            let paint = self.state.paint.clone();
+            self.fill_scratch_path(transform, fill_rule, &paint, transform);
         }
     }
 
@@ -557,18 +597,40 @@ impl<'a> Context<'a> {
         if a <= 0.0 {
             return;
         }
-        let color = self.state.paint.with_alpha(clamp_finite_f32(self.state.paint.a, 0.0, 1.0) * a);
-        let Some((cmd_index, is_opaque)) = self.push_draw_color(color) else {
-            return;
-        };
-        if is_opaque {
-            self.clear(color);
+        if let Paint::Solid(c) = self.state.paint {
+            let color = c.with_alpha(clamp_finite_f32(c.a, 0.0, 1.0) * a);
+            let Some((cmd_index, is_opaque)) =
+                self.push_draw_paint(&Paint::Solid(color), self.state.transform, 1.0)
+            else {
+                return;
+            };
+            if is_opaque {
+                self.clear(color);
+                return;
+            }
+            self.binner.push_cmd_to_all_tiles(
+                TileCmd {
+                    kind: TileCmdKind::SolidTile,
+                    flags: 0,
+                    aux: 0,
+                    cmd_index,
+                    head_chunk: NO_CHUNK,
+                    backdrop: 1,
+                },
+                &mut self.arena,
+            );
             return;
         }
+        let paint = self.state.paint.clone();
+        let Some((cmd_index, is_opaque)) = self.push_draw_paint(&paint, self.state.transform, a)
+        else {
+            return;
+        };
+        let flags = if is_opaque { TILE_FLAG_OPAQUE } else { 0 };
         self.binner.push_cmd_to_all_tiles(
             TileCmd {
                 kind: TileCmdKind::SolidTile,
-                flags: 0,
+                flags,
                 aux: 0,
                 cmd_index,
                 head_chunk: NO_CHUNK,
@@ -631,24 +693,66 @@ impl<'a> Context<'a> {
         pb.finish()
     }
 
-    fn push_draw_color(&mut self, color: Color) -> Option<(u32, bool)> {
-        if self.use_f32 {
-            let lin = color.to_linear_f32();
-            if lin.a <= 0.0 && lin.r == 0.0 && lin.g == 0.0 && lin.b == 0.0 {
-                return None;
+    fn push_draw_paint(
+        &mut self,
+        paint: &Paint,
+        ctm: Affine2D,
+        alpha_scale: f32,
+    ) -> Option<(u32, bool)> {
+        match paint {
+            Paint::Solid(color) => {
+                let c = if alpha_scale < 1.0 {
+                    color.with_alpha(clamp_finite_f32(color.a, 0.0, 1.0) * alpha_scale)
+                } else {
+                    *color
+                };
+                if self.use_f32 {
+                    let lin = c.to_linear_f32();
+                    if lin.a <= 0.0 && lin.r == 0.0 && lin.g == 0.0 && lin.b == 0.0 {
+                        return None;
+                    }
+                    let idx = self.draw_paints_f32.len() as u32;
+                    self.draw_paints_f32.push(DrawPaintF32::Solid(lin));
+                    Some((idx, lin.a >= 1.0))
+                } else {
+                    let lin = c.to_linear_rgba16();
+                    if lin.a == 0 {
+                        return None;
+                    }
+                    let idx = self.draw_paints16.len() as u32;
+                    self.draw_paints16.push(DrawPaint16::Solid(lin));
+                    Some((idx, lin.a == 65535))
+                }
             }
-            let idx = self.draw_colors_f32.len() as u32;
-            self.draw_colors_f32.push(lin);
-            Some((idx, lin.a >= 1.0))
-        } else {
-            let lin = color.to_linear_rgba16();
-            if lin.a == 0 {
-                return None;
+            Paint::LinearGradient(g) => {
+                let prep = PreparedGradient::prepare_linear(g, ctm, alpha_scale, self.use_f32)?;
+                Some(self.push_prepared_gradient(prep))
             }
-            let idx = self.draw_colors16.len() as u32;
-            self.draw_colors16.push(lin);
-            Some((idx, lin.a == 65535))
+            Paint::RadialGradient(g) => {
+                let prep = PreparedGradient::prepare_radial(g, ctm, alpha_scale, self.use_f32)?;
+                Some(self.push_prepared_gradient(prep))
+            }
+            Paint::ConicGradient(g) => {
+                let prep = PreparedGradient::prepare_conic(g, ctm, alpha_scale, self.use_f32)?;
+                Some(self.push_prepared_gradient(prep))
+            }
         }
+    }
+
+    fn push_prepared_gradient(&mut self, prep: PreparedGradient) -> (u32, bool) {
+        let is_opaque = prep.is_opaque();
+        let grad_idx = self.draw_gradients.len();
+        self.draw_gradients.push(prep);
+        let cmd_idx = if self.use_f32 {
+            let idx = self.draw_paints_f32.len() as u32;
+            self.draw_paints_f32.push(DrawPaintF32::Gradient(grad_idx));
+            idx
+        } else {
+            let idx = self.draw_paints16.len() as u32;
+            self.draw_paints16.push(DrawPaint16::Gradient(grad_idx));
+            idx
+        };
+        (cmd_idx, is_opaque)
     }
 
     fn fill_internal(
@@ -656,7 +760,8 @@ impl<'a> Context<'a> {
         path: &Path,
         transform: Affine2D,
         fill_rule: FillRule,
-        color: Color,
+        paint: &Paint,
+        paint_ctm: Affine2D,
     ) {
         if path.is_empty() {
             return;
@@ -674,7 +779,7 @@ impl<'a> Context<'a> {
         if range.is_empty() {
             return;
         }
-        let Some((cmd_index, is_opaque)) = self.push_draw_color(color) else {
+        let Some((cmd_index, is_opaque)) = self.push_draw_paint(paint, paint_ctm, 1.0) else {
             return;
         };
         let mut flags = 0u8;
@@ -688,7 +793,13 @@ impl<'a> Context<'a> {
             .bin_path(range, fill_rule, cmd_index, flags, &mut self.arena);
     }
 
-    fn fill_scratch_path(&mut self, transform: Affine2D, fill_rule: FillRule, color: Color) {
+    fn fill_scratch_path(
+        &mut self,
+        transform: Affine2D,
+        fill_rule: FillRule,
+        paint: &Paint,
+        paint_ctm: Affine2D,
+    ) {
         if self.scratch_path.is_empty() {
             return;
         }
@@ -705,7 +816,7 @@ impl<'a> Context<'a> {
         if range.is_empty() {
             return;
         }
-        let Some((cmd_index, is_opaque)) = self.push_draw_color(color) else {
+        let Some((cmd_index, is_opaque)) = self.push_draw_paint(paint, paint_ctm, 1.0) else {
             return;
         };
         let mut flags = 0u8;
@@ -722,9 +833,9 @@ impl<'a> Context<'a> {
     // Composites all queued tile commands in a single L1-resident pass per tile.
     pub fn flush(&mut self) {
         let has_draws = if self.use_f32 {
-            !self.draw_colors_f32.is_empty()
+            !self.draw_paints_f32.is_empty()
         } else {
-            !self.draw_colors16.is_empty()
+            !self.draw_paints16.is_empty()
         };
         if self.pending_clear.is_none() && !has_draws {
             return;
@@ -748,15 +859,18 @@ impl<'a> Context<'a> {
 
         if self.use_f32 {
             let clear_lin = self.pending_clear.map(Color::to_linear_f32);
+            let mut span_buf = [LinearRgbaF32::TRANSPARENT; TILE_SIZE];
             for ty in 0..tiles_y {
+                let oy = ty * TILE_SIZE;
                 for tx in 0..tiles_x {
+                    let ox = tx * TILE_SIZE;
                     let tid = self.binner.tile_index(tx, ty);
                     let has_cmds = self.binner.tile_has_cmds(tid);
                     if !has_cmds && clear_lin.is_none() {
                         continue;
                     }
-                    let tw = ((w as usize) - tx * TILE_SIZE).min(TILE_SIZE);
-                    let th = ((h as usize) - ty * TILE_SIZE).min(TILE_SIZE);
+                    let tw = ((w as usize) - ox).min(TILE_SIZE);
+                    let th = ((h as usize) - oy).min(TILE_SIZE);
 
                     if let Some(bg) = clear_lin {
                         self.tile_buf_f32.clear_rect(tw, th, bg);
@@ -775,36 +889,114 @@ impl<'a> Context<'a> {
                     }
 
                     for cmd in self.binner.tile_cmds(tid, &self.arena) {
-                        let src = self.draw_colors_f32[cmd.cmd_index as usize];
-                        match cmd.kind {
-                            TileCmdKind::Clear => self.tile_buf_f32.clear_rect(tw, th, src),
-                            TileCmdKind::SolidTile => {
-                                fill_solid_tile_src_over_f32(&mut self.tile_buf_f32, tw, th, src);
-                            }
-                            TileCmdKind::PathFill => {
-                                let params = TileFillParams::from_cmd(cmd, tw, th);
-                                let tile_buf = &mut self.tile_buf_f32;
-                                self.scratch.rasterize_tile_spans(
-                                    params,
-                                    &self.arena,
-                                    |span| match span {
-                                        CoverageSpan::Solid { y, x0, x1 } => {
-                                            fill_solid_span_src_over_f32(
-                                                &mut tile_buf.row_mut(y)[x0..x1],
-                                                src,
-                                            );
+                        match self.draw_paints_f32[cmd.cmd_index as usize] {
+                            DrawPaintF32::Solid(src) => match cmd.kind {
+                                TileCmdKind::Clear => self.tile_buf_f32.clear_rect(tw, th, src),
+                                TileCmdKind::SolidTile => {
+                                    fill_solid_tile_src_over_f32(
+                                        &mut self.tile_buf_f32,
+                                        tw,
+                                        th,
+                                        src,
+                                    );
+                                }
+                                TileCmdKind::PathFill => {
+                                    let params = TileFillParams::from_cmd(cmd, tw, th);
+                                    let tile_buf = &mut self.tile_buf_f32;
+                                    self.scratch.rasterize_tile_spans(
+                                        params,
+                                        &self.arena,
+                                        |span| match span {
+                                            CoverageSpan::Solid { y, x0, x1 } => {
+                                                fill_solid_span_src_over_f32(
+                                                    &mut tile_buf.row_mut(y)[x0..x1],
+                                                    src,
+                                                );
+                                            }
+                                            CoverageSpan::Fractional { y, x0, cov } => {
+                                                fill_cov_span_src_over_f32(
+                                                    &mut tile_buf.row_mut(y)[x0..x0 + cov.len()],
+                                                    cov,
+                                                    src,
+                                                );
+                                            }
+                                        },
+                                    );
+                                }
+                                _ => {}
+                            },
+                            DrawPaintF32::Gradient(grad_idx) => {
+                                let grad = &self.draw_gradients[grad_idx];
+                                match cmd.kind {
+                                    TileCmdKind::Clear | TileCmdKind::SolidTile => {
+                                        if grad.is_opaque() || cmd.kind == TileCmdKind::Clear {
+                                            for py in 0..th {
+                                                grad.eval_span_f32(
+                                                    ox,
+                                                    oy + py,
+                                                    &mut self.tile_buf_f32.row_mut(py)[..tw],
+                                                );
+                                            }
+                                        } else {
+                                            for py in 0..th {
+                                                grad.eval_span_f32(
+                                                    ox,
+                                                    oy + py,
+                                                    &mut span_buf[..tw],
+                                                );
+                                                blend_span_src_over_f32(
+                                                    &mut self.tile_buf_f32.row_mut(py)[..tw],
+                                                    &span_buf[..tw],
+                                                );
+                                            }
                                         }
-                                        CoverageSpan::Fractional { y, x0, cov } => {
-                                            fill_cov_span_src_over_f32(
-                                                &mut tile_buf.row_mut(y)[x0..x0 + cov.len()],
-                                                cov,
-                                                src,
-                                            );
-                                        }
-                                    },
-                                );
+                                    }
+                                    TileCmdKind::PathFill => {
+                                        let params = TileFillParams::from_cmd(cmd, tw, th);
+                                        let tile_buf = &mut self.tile_buf_f32;
+                                        self.scratch.rasterize_tile_spans(
+                                            params,
+                                            &self.arena,
+                                            |span| match span {
+                                                CoverageSpan::Solid { y, x0, x1 } => {
+                                                    if grad.is_opaque() {
+                                                        grad.eval_span_f32(
+                                                            ox + x0,
+                                                            oy + y,
+                                                            &mut tile_buf.row_mut(y)[x0..x1],
+                                                        );
+                                                    } else {
+                                                        let len = x1 - x0;
+                                                        grad.eval_span_f32(
+                                                            ox + x0,
+                                                            oy + y,
+                                                            &mut span_buf[..len],
+                                                        );
+                                                        blend_span_src_over_f32(
+                                                            &mut tile_buf.row_mut(y)[x0..x1],
+                                                            &span_buf[..len],
+                                                        );
+                                                    }
+                                                }
+                                                CoverageSpan::Fractional { y, x0, cov } => {
+                                                    let len = cov.len();
+                                                    grad.eval_span_f32(
+                                                        ox + x0,
+                                                        oy + y,
+                                                        &mut span_buf[..len],
+                                                    );
+                                                    blend_cov_span_src_over_f32(
+                                                        &mut tile_buf.row_mut(y)[x0..x0 + len],
+                                                        cov,
+                                                        &span_buf[..len],
+                                                    );
+                                                }
+                                            },
+                                        );
+                                    }
+                                    _ => {}
+                                }
                             }
-                            _ => {}
                         }
                     }
                     store_tile_f32(&self.tile_buf_f32, &mut self.surface, tx, ty, dither);
@@ -812,15 +1004,18 @@ impl<'a> Context<'a> {
             }
         } else {
             let clear_lin = self.pending_clear.map(Color::to_linear_rgba16);
+            let mut span_buf = [LinearRgba16::TRANSPARENT; TILE_SIZE];
             for ty in 0..tiles_y {
+                let oy = ty * TILE_SIZE;
                 for tx in 0..tiles_x {
+                    let ox = tx * TILE_SIZE;
                     let tid = self.binner.tile_index(tx, ty);
                     let has_cmds = self.binner.tile_has_cmds(tid);
                     if !has_cmds && clear_lin.is_none() {
                         continue;
                     }
-                    let tw = ((w as usize) - tx * TILE_SIZE).min(TILE_SIZE);
-                    let th = ((h as usize) - ty * TILE_SIZE).min(TILE_SIZE);
+                    let tw = ((w as usize) - ox).min(TILE_SIZE);
+                    let th = ((h as usize) - oy).min(TILE_SIZE);
 
                     if let Some(bg) = clear_lin {
                         self.tile_buf16.clear_rect(tw, th, bg);
@@ -839,36 +1034,114 @@ impl<'a> Context<'a> {
                     }
 
                     for cmd in self.binner.tile_cmds(tid, &self.arena) {
-                        let src = self.draw_colors16[cmd.cmd_index as usize];
-                        match cmd.kind {
-                            TileCmdKind::Clear => self.tile_buf16.clear_rect(tw, th, src),
-                            TileCmdKind::SolidTile => {
-                                fill_solid_tile_src_over_u16(&mut self.tile_buf16, tw, th, src);
-                            }
-                            TileCmdKind::PathFill => {
-                                let params = TileFillParams::from_cmd(cmd, tw, th);
-                                let tile_buf = &mut self.tile_buf16;
-                                self.scratch.rasterize_tile_spans(
-                                    params,
-                                    &self.arena,
-                                    |span| match span {
-                                        CoverageSpan::Solid { y, x0, x1 } => {
-                                            fill_solid_span_src_over_u16(
-                                                &mut tile_buf.row_mut(y)[x0..x1],
-                                                src,
-                                            );
+                        match self.draw_paints16[cmd.cmd_index as usize] {
+                            DrawPaint16::Solid(src) => match cmd.kind {
+                                TileCmdKind::Clear => self.tile_buf16.clear_rect(tw, th, src),
+                                TileCmdKind::SolidTile => {
+                                    fill_solid_tile_src_over_u16(
+                                        &mut self.tile_buf16,
+                                        tw,
+                                        th,
+                                        src,
+                                    );
+                                }
+                                TileCmdKind::PathFill => {
+                                    let params = TileFillParams::from_cmd(cmd, tw, th);
+                                    let tile_buf = &mut self.tile_buf16;
+                                    self.scratch.rasterize_tile_spans(
+                                        params,
+                                        &self.arena,
+                                        |span| match span {
+                                            CoverageSpan::Solid { y, x0, x1 } => {
+                                                fill_solid_span_src_over_u16(
+                                                    &mut tile_buf.row_mut(y)[x0..x1],
+                                                    src,
+                                                );
+                                            }
+                                            CoverageSpan::Fractional { y, x0, cov } => {
+                                                fill_cov_span_src_over_u16(
+                                                    &mut tile_buf.row_mut(y)[x0..x0 + cov.len()],
+                                                    cov,
+                                                    src,
+                                                );
+                                            }
+                                        },
+                                    );
+                                }
+                                _ => {}
+                            },
+                            DrawPaint16::Gradient(grad_idx) => {
+                                let grad = &self.draw_gradients[grad_idx];
+                                match cmd.kind {
+                                    TileCmdKind::Clear | TileCmdKind::SolidTile => {
+                                        if grad.is_opaque() || cmd.kind == TileCmdKind::Clear {
+                                            for py in 0..th {
+                                                grad.eval_span_u16(
+                                                    ox,
+                                                    oy + py,
+                                                    &mut self.tile_buf16.row_mut(py)[..tw],
+                                                );
+                                            }
+                                        } else {
+                                            for py in 0..th {
+                                                grad.eval_span_u16(
+                                                    ox,
+                                                    oy + py,
+                                                    &mut span_buf[..tw],
+                                                );
+                                                blend_span_src_over_u16(
+                                                    &mut self.tile_buf16.row_mut(py)[..tw],
+                                                    &span_buf[..tw],
+                                                );
+                                            }
                                         }
-                                        CoverageSpan::Fractional { y, x0, cov } => {
-                                            fill_cov_span_src_over_u16(
-                                                &mut tile_buf.row_mut(y)[x0..x0 + cov.len()],
-                                                cov,
-                                                src,
-                                            );
-                                        }
-                                    },
-                                );
+                                    }
+                                    TileCmdKind::PathFill => {
+                                        let params = TileFillParams::from_cmd(cmd, tw, th);
+                                        let tile_buf = &mut self.tile_buf16;
+                                        self.scratch.rasterize_tile_spans(
+                                            params,
+                                            &self.arena,
+                                            |span| match span {
+                                                CoverageSpan::Solid { y, x0, x1 } => {
+                                                    if grad.is_opaque() {
+                                                        grad.eval_span_u16(
+                                                            ox + x0,
+                                                            oy + y,
+                                                            &mut tile_buf.row_mut(y)[x0..x1],
+                                                        );
+                                                    } else {
+                                                        let len = x1 - x0;
+                                                        grad.eval_span_u16(
+                                                            ox + x0,
+                                                            oy + y,
+                                                            &mut span_buf[..len],
+                                                        );
+                                                        blend_span_src_over_u16(
+                                                            &mut tile_buf.row_mut(y)[x0..x1],
+                                                            &span_buf[..len],
+                                                        );
+                                                    }
+                                                }
+                                                CoverageSpan::Fractional { y, x0, cov } => {
+                                                    let len = cov.len();
+                                                    grad.eval_span_u16(
+                                                        ox + x0,
+                                                        oy + y,
+                                                        &mut span_buf[..len],
+                                                    );
+                                                    blend_cov_span_src_over_u16(
+                                                        &mut tile_buf.row_mut(y)[x0..x0 + len],
+                                                        cov,
+                                                        &span_buf[..len],
+                                                    );
+                                                }
+                                            },
+                                        );
+                                    }
+                                    _ => {}
+                                }
                             }
-                            _ => {}
                         }
                     }
                     store_tile_u16(&self.tile_buf16, &mut self.surface, tx, ty, dither);
@@ -877,8 +1150,9 @@ impl<'a> Context<'a> {
         }
 
         self.pending_clear = None;
-        self.draw_colors16.clear();
-        self.draw_colors_f32.clear();
+        self.draw_paints16.clear();
+        self.draw_paints_f32.clear();
+        self.draw_gradients.clear();
         self.arena.reset();
         self.binner.reset(w, h);
     }

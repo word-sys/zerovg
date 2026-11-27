@@ -7,9 +7,10 @@ use crate::math::color::{ColorSpace, LinearRgba16, LinearRgbaF32};
 use crate::surface::PixelFormat;
 
 pub use scalar::{
-    fill_cov_span_src_over_f32, fill_cov_span_src_over_u16, fill_solid_span_src_over_f32,
-    fill_solid_span_src_over_u16, fill_solid_tile_src_over_f32, fill_solid_tile_src_over_u16,
-    load_tile_f32, load_tile_u16, store_tile_f32, store_tile_u16,
+    blend_cov_span_src_over_f32, blend_cov_span_src_over_u16, blend_span_src_over_f32,
+    blend_span_src_over_u16, fill_cov_span_src_over_f32, fill_cov_span_src_over_u16,
+    fill_solid_span_src_over_f32, fill_solid_span_src_over_u16, fill_solid_tile_src_over_f32,
+    fill_solid_tile_src_over_u16, load_tile_f32, load_tile_u16, store_tile_f32, store_tile_u16,
 };
 
 #[inline]

@@ -243,6 +243,60 @@ pub fn fill_cov_span_src_over_f32(dst: &mut [LinearRgbaF32], cov: &[u16], src: L
     }
 }
 
+#[inline]
+pub fn blend_span_src_over_u16(dst: &mut [LinearRgba16], src: &[LinearRgba16]) {
+    let len = dst.len().min(src.len());
+    for (d, &s) in dst[..len].iter_mut().zip(src[..len].iter()) {
+        *d = s.src_over(*d);
+    }
+}
+
+#[inline]
+pub fn blend_cov_span_src_over_u16(dst: &mut [LinearRgba16], cov: &[u16], src: &[LinearRgba16]) {
+    let len = dst.len().min(cov.len()).min(src.len());
+    for ((d, &c), &s) in dst[..len]
+        .iter_mut()
+        .zip(cov[..len].iter())
+        .zip(src[..len].iter())
+    {
+        if c == 0 || s.a == 0 {
+            continue;
+        }
+        let sc = s.scale_coverage(c);
+        *d = sc.src_over(*d);
+    }
+}
+
+#[inline]
+pub fn blend_span_src_over_f32(dst: &mut [LinearRgbaF32], src: &[LinearRgbaF32]) {
+    let len = dst.len().min(src.len());
+    for (d, &s) in dst[..len].iter_mut().zip(src[..len].iter()) {
+        *d = s.src_over(*d);
+    }
+}
+
+#[inline]
+pub fn blend_cov_span_src_over_f32(dst: &mut [LinearRgbaF32], cov: &[u16], src: &[LinearRgbaF32]) {
+    const INV65535: f32 = 1.0 / 65535.0;
+    let len = dst.len().min(cov.len()).min(src.len());
+    for ((d, &c), &s) in dst[..len]
+        .iter_mut()
+        .zip(cov[..len].iter())
+        .zip(src[..len].iter())
+    {
+        if c == 0 {
+            continue;
+        }
+        if c == 65535 {
+            *d = s.src_over(*d);
+            continue;
+        }
+        let cf = (c as f32) * INV65535;
+        let sc = LinearRgbaF32::new(s.r * cf, s.g * cf, s.b * cf, s.a * cf);
+        *d = sc.src_over(*d);
+    }
+}
+
 pub fn store_tile_u16(
     tile_buf: &TileBuffer16,
     surface: &mut SurfaceMut<'_>,
